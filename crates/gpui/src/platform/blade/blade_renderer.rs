@@ -18,6 +18,20 @@ use std::{mem, sync::Arc};
 const MAX_FRAME_TIME_MS: u32 = 10000;
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
+#[cfg(target_os = "windows")]
+fn calculate_gamma_correction_params() -> ([f32; 4], f32) {
+    use crate::platform::get_dwrite_render_params;
+    
+    // Get the DirectWrite rendering parameters exactly like dwrite-hlsl does
+    get_dwrite_render_params()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn calculate_gamma_correction_params() -> ([f32; 4], f32) {
+    // For non-Windows platforms, use neutral gamma correction (no change)
+    ([0.0, 0.0, 0.0, 0.0], 1.0)
+}
+
 const DEFAULT_PATH_SAMPLE_COUNT: u32 = 4;
 
 #[repr(C)]
@@ -25,7 +39,12 @@ const DEFAULT_PATH_SAMPLE_COUNT: u32 = 4;
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    // --- 4 bytes of padding ---
+    _padding1: u32,
+    gamma_ratios: [f32; 4],
+    grayscale_enhanced_contrast: f32,
+    // --- 12 bytes of padding to round the total size up to a multiple of 16 ---
+    _padding2: [f32; 3],
 }
 
 //Note: we can't use `Bounds` directly here because
@@ -519,10 +538,14 @@ impl BladeRenderer {
 
         for (texture_id, vertices) in vertices_by_texture_id {
             let tex_info = self.atlas.get_texture_info(texture_id);
+            let (gamma_ratios, grayscale_enhanced_contrast) = calculate_gamma_correction_params();
             let globals = GlobalParams {
                 viewport_size: [tex_info.size.width as f32, tex_info.size.height as f32],
                 premultiplied_alpha: 0,
-                pad: 0,
+                _padding1: 0,
+                gamma_ratios,
+                grayscale_enhanced_contrast,
+                _padding2: [0.0, 0.0, 0.0],
             };
 
             let vertex_buf = unsafe { self.instance_belt.alloc_typed(&vertices, &self.gpu) };
@@ -582,6 +605,7 @@ impl BladeRenderer {
         };
         self.command_encoder.init_texture(frame.texture());
 
+        let (gamma_ratios, grayscale_enhanced_contrast) = calculate_gamma_correction_params();
         let globals = GlobalParams {
             viewport_size: [
                 self.surface_config.size.width as f32,
@@ -591,7 +615,10 @@ impl BladeRenderer {
                 gpu::AlphaMode::Ignored | gpu::AlphaMode::PostMultiplied => 0,
                 gpu::AlphaMode::PreMultiplied => 1,
             },
-            pad: 0,
+            _padding1: 0,
+            gamma_ratios,
+            grayscale_enhanced_contrast,
+            _padding2: [0.0, 0.0, 0.0],
         };
 
         if let mut pass = self.command_encoder.render(

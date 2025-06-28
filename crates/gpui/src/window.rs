@@ -2741,8 +2741,25 @@ impl Window {
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.content_mask().scale(scale_factor);
+            
+            // Determine if this is a thin font for gamma correction
+            let is_thin_font = if let Some(font) = self.text_system().get_font_for_id(font_id) {
+                #[cfg(target_os = "windows")]
+                {
+                    crate::platform::is_thin_font_family(&font.family)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    false
+                }
+            } else {
+                false
+            };
+            
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
+                is_text: 1, // This is text rendering
+                is_thin_font: if is_thin_font { 1 } else { 0 },
                 pad: 0,
                 bounds,
                 content_mask,
@@ -2852,6 +2869,8 @@ impl Window {
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
+            is_text: 0, // This is not text rendering
+            is_thin_font: 0, // Not applicable for SVG
             pad: 0,
             bounds: bounds
                 .map_origin(|origin| origin.floor())

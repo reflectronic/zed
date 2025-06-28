@@ -31,7 +31,8 @@ fn heat_map_color(value: f32, minValue: f32, maxValue: f32, position: vec2<f32>)
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    gamma_ratios: vec4<f32>,
+    grayscale_enhanced_contrast: f32,
 }
 
 var<uniform> globals: GlobalParams;
@@ -1080,6 +1081,8 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
 struct MonochromeSprite {
     order: u32,
+    is_text: u32,
+    is_thin_font: u32,
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
@@ -1093,7 +1096,9 @@ struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
-    @location(3) clip_distances: vec4<f32>,
+    @location(2) @interpolate(flat) is_text: u32,
+    @location(3) @interpolate(flat) is_thin_font: u32,
+    @location(4) clip_distances: vec4<f32>,
 }
 
 @vertex
@@ -1106,8 +1111,113 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
+    out.is_text = sprite.is_text;
+    out.is_thin_font = sprite.is_thin_font;
     out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
     return out;
+}
+
+// DirectWrite gamma-corrected text blending functions
+// Ported from dwrite-hlsl project for high-quality text rendering
+// https://github.com/lhecker/dwrite-hlsl
+
+fn dwrite_apply_light_on_dark_contrast_adjustment(grayscale_enhanced_contrast: f32, color: vec3<f32>) -> f32 {
+    // The following 1 line is the same as this direct translation of the
+    // original code, but simplified to reduce the number of instructions:
+    //   let lightness = dot(color, vec3<f32>(0.30, 0.59, 0.11));
+    //   let multiplier = saturate(4.0 * (0.75 - lightness));
+    //   return grayscale_enhanced_contrast * multiplier;
+    return grayscale_enhanced_contrast * saturate(dot(color, vec3<f32>(0.30, 0.59, 0.11) * -4.0) + 3.0);
+}
+
+fn dwrite_calc_color_intensity(color: vec3<f32>) -> f32 {
+    return dot(color, vec3<f32>(0.25, 0.5, 0.25));
+}
+
+fn dwrite_enhance_contrast(alpha: f32, k: f32) -> f32 {
+    return alpha * (k + 1.0) / (alpha * k + 1.0);
+}
+
+fn dwrite_apply_alpha_correction(a: f32, f: f32, g: vec4<f32>) -> f32 {
+    return a + a * (1.0 - a) * ((g.x * f + g.y) * a + (g.z * f + g.w));
+}
+
+fn dwrite_unpremultiply_color(color: vec4<f32>) -> vec3<f32> {
+    if color.a != 0.0 {
+        return color.rgb / color.a;
+    }
+    return color.rgb;
+}
+
+// Call this function to get the same gamma corrected alpha blending effect
+// as DirectWrite's native algorithm for gray-scale anti-aliased glyphs.
+//
+// The result is a premultiplied color value, resulting
+// out of the blending of foregroundColor with glyphAlpha.
+//
+// gammaRatios:
+//   Magic constants produced by DWrite_GetGammaRatios() in dwrite.cpp.
+//   The default value for this are the 1.8 gamma ratios, which equates to:
+//     0.148054421f, -0.894594550f, 1.47590804f, -0.324668258f
+// grayscaleEnhancedContrast:
+//   An additional contrast boost, making the font lighter/darker.
+//   The default value for this is 1.0f.
+//   This value should be set to the return value of DWrite_GetRenderParams() or (pseudo-code):
+//     IDWriteRenderingParams1* defaultParams;
+//     dwriteFactory->CreateRenderingParams(&defaultParams);
+//     gamma = defaultParams->GetGrayscaleEnhancedContrast();
+// isThinFont:
+//   This constant is true for certain fonts that are simply too thin for AA.
+//   Unlike the previous two values, this value isn't a constant and can change per font family.
+//   If you only use modern fonts (like Roboto) you can safely assume that it's false.
+//   If you draw your glyph atlas with any DirectWrite method except IDWriteGlyphRunAnalysis::CreateAlphaTexture
+//   then you must set this to false as well, as not even tricks like setting the
+//   gamma to 1.0 disables the internal thin-font contrast-boost inside DirectWrite.
+//   Applying the contrast-boost twice would then look incorrectly.
+// foregroundColor:
+//   The text's foreground color in premultiplied alpha.
+// glyphAlpha:
+//   The alpha value of the current glyph pixel in your texture atlas.
+fn dwrite_grayscale_blend(gamma_ratios: vec4<f32>, grayscale_enhanced_contrast: f32, 
+                         is_thin_font: bool, foreground_color: vec4<f32>, glyph_alpha: f32) -> vec4<f32> {
+    let foreground_straight = dwrite_unpremultiply_color(foreground_color);
+    let contrast_boost   = select(0.0, 0.5, is_thin_font);
+    let blend_enhanced_contrast = contrast_boost + dwrite_apply_light_on_dark_contrast_adjustment(grayscale_enhanced_contrast, foreground_straight);
+    let intensity = dwrite_calc_color_intensity(foreground_color.rgb);
+    let contrasted = dwrite_enhance_contrast(glyph_alpha, blend_enhanced_contrast);
+    return foreground_color * dwrite_apply_alpha_correction(contrasted, intensity, gamma_ratios);
+}
+
+fn blend_text_color(color: vec4<f32>, alpha_factor: f32, is_text: bool, is_thin_font: bool) -> vec4<f32> {
+    if is_text {
+        // Apply DirectWrite-compatible gamma correction for text using the proper grayscale blend
+        // Convert foreground color to premultiplied alpha as expected by DirectWrite algorithm
+        let premult_foreground = vec4<f32>(color.rgb * color.a, color.a);
+        let blended = dwrite_grayscale_blend(
+            // globals.gamma_ratios,
+            vec4<f32>( 0.148054421f, -0.894594550f, 1.47590804f, -0.324668258f),
+            // globals.grayscale_enhanced_contrast,
+            1,
+            // is_thin_font,
+            false,
+            premult_foreground,
+            alpha_factor
+        );
+        
+        if globals.premultiplied_alpha != 0u {
+            return blended;
+        } else {
+            // For straight alpha mode, unpremultiply the DirectWrite result
+            if blended.a > 0.0 {
+                return vec4<f32>(blended.rgb / blended.a, blended.a);
+            } else {
+                return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            }
+        }
+    } else {
+        // Use regular blending for non-text
+        return blend_color(color, alpha_factor);
+    }
 }
 
 @fragment
@@ -1117,7 +1227,8 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
-    return blend_color(input.color, sample);
+    //return vec4<f32>(globals.gamma_ratios.x, globals.gamma_ratios.y, globals.gamma_ratios.z, 1.);
+    return blend_text_color(input.color, sample, input.is_text != 0u, input.is_thin_font != 0u);
 }
 
 // --- polychrome sprites --- //

@@ -27,6 +27,57 @@ use crate::*;
 
 const MEASURING_MODE: DWRITE_MEASURING_MODE = DWRITE_MEASURING_MODE_NATURAL;
 
+/// Calculate gamma ratios for DirectWrite-compatible text rendering in shaders
+/// Based on the algorithm from dwrite-hlsl by lhecker (Windows Terminal)
+fn calculate_gamma_ratios(gamma: f32) -> [f32; 4] {
+    // Pre-calculated gamma ratio lookup table for different gamma values (1.0 to 2.2)
+    const GAMMA_RATIOS: [[f32; 4]; 13] = [
+        [0.0000f32 / 4.0, 0.0000f32 / 4.0, 0.0000f32 / 4.0, 0.0000f32 / 4.0], // gamma = 1.0
+        [0.0166f32 / 4.0, -0.0807f32 / 4.0, 0.2227f32 / 4.0, -0.0751f32 / 4.0], // gamma = 1.1
+        [0.0350f32 / 4.0, -0.1760f32 / 4.0, 0.4325f32 / 4.0, -0.1370f32 / 4.0], // gamma = 1.2
+        [0.0543f32 / 4.0, -0.2821f32 / 4.0, 0.6302f32 / 4.0, -0.1876f32 / 4.0], // gamma = 1.3
+        [0.0739f32 / 4.0, -0.3963f32 / 4.0, 0.8167f32 / 4.0, -0.2287f32 / 4.0], // gamma = 1.4
+        [0.0933f32 / 4.0, -0.5161f32 / 4.0, 0.9926f32 / 4.0, -0.2616f32 / 4.0], // gamma = 1.5
+        [0.1121f32 / 4.0, -0.6395f32 / 4.0, 1.1588f32 / 4.0, -0.2877f32 / 4.0], // gamma = 1.6
+        [0.1300f32 / 4.0, -0.7649f32 / 4.0, 1.3159f32 / 4.0, -0.3080f32 / 4.0], // gamma = 1.7
+        [0.1469f32 / 4.0, -0.8911f32 / 4.0, 1.4644f32 / 4.0, -0.3234f32 / 4.0], // gamma = 1.8
+        [0.1627f32 / 4.0, -1.0170f32 / 4.0, 1.6051f32 / 4.0, -0.3347f32 / 4.0], // gamma = 1.9
+        [0.1773f32 / 4.0, -1.1420f32 / 4.0, 1.7385f32 / 4.0, -0.3426f32 / 4.0], // gamma = 2.0
+        [0.1908f32 / 4.0, -1.2652f32 / 4.0, 1.8650f32 / 4.0, -0.3476f32 / 4.0], // gamma = 2.1
+        [0.2031f32 / 4.0, -1.3864f32 / 4.0, 1.9851f32 / 4.0, -0.3501f32 / 4.0], // gamma = 2.2
+    ];
+
+    const NORM13: f32 = (0x10000 as f64 / (255.0 * 255.0) * 4.0) as f32;
+    const NORM24: f32 = (0x100 as f64 / 255.0 * 4.0) as f32;
+
+    // Clamp gamma to supported range and find table index
+    let index = ((gamma * 10.0 + 0.5) as usize).clamp(10, 22) - 10;
+    let ratios = [0.1469f32 / 4.0, -0.8911f32 / 4.0, 1.4644f32 / 4.0, -0.3234f32 / 4.0];//GAMMA_RATIOS[index];
+
+    [
+        NORM13 * ratios[0], 
+        NORM24 * ratios[1],
+        NORM13 * ratios[2],
+        NORM24 * ratios[3],
+    ]
+}
+
+/// List of font families that require special "thin font" treatment
+/// These fonts historically have strokes that are too thin due to being digitized from typewriter balls
+const THIN_FONT_FAMILIES: &[&str] = &[
+    "Courier New",
+    "Fixed Miriam Transparent", 
+    "Miriam Fixed",
+    "Rod",
+    "Rod Transparent",
+    "Simplified Arabic Fixed",
+];
+
+/// Check if a font family is considered "thin" and needs special contrast treatment
+pub fn is_thin_font_family(family_name: &str) -> bool {
+    THIN_FONT_FAMILIES.binary_search(&family_name).is_ok()
+}
+
 #[derive(Debug)]
 struct FontInfo {
     font_family: String,
@@ -86,16 +137,18 @@ impl DirectWriteComponent {
 
             let default_params: IDWriteRenderingParams3 =
                 factory.CreateRenderingParams()?.cast()?;
-            let gamma = default_params.GetGamma();
-            let enhanced_contrast = default_params.GetEnhancedContrast();
-            let gray_contrast = default_params.GetGrayscaleEnhancedContrast();
+            let _gamma = default_params.GetGamma();
+            let _enhanced_contrast = default_params.GetEnhancedContrast();
+            let _gray_contrast = default_params.GetGrayscaleEnhancedContrast();
             let cleartype_level = default_params.GetClearTypeLevel();
             let grid_fit_mode = default_params.GetGridFitMode();
 
+            // Create linear rendering parameters to disable DirectWrite's internal gamma correction
+            // We'll do gamma correction in the shader instead for better quality
             let render_params = factory.CreateCustomRenderingParams(
-                gamma,
-                enhanced_contrast,
-                gray_contrast,
+                1.0,  // gamma: linear (no correction)
+                0.0,  // enhanced_contrast: no contrast boost
+                0.0,  // gray_contrast: no grayscale contrast boost
                 cleartype_level,
                 DWRITE_PIXEL_GEOMETRY_RGB,
                 DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
@@ -1494,3 +1547,29 @@ const BRUSH_COLOR: D2D1_COLOR_F = D2D1_COLOR_F {
     b: 1.0,
     a: 1.0,
 };
+
+/// Get DirectWrite rendering parameters for text blending
+/// Returns (gamma_ratios, grayscale_enhanced_contrast)
+pub fn get_dwrite_render_params() -> ([f32; 4], f32) {
+    unsafe {
+        // Get system rendering parameters
+        let factory: IDWriteFactory5 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
+            .unwrap_or_else(|_| panic!("Failed to create DirectWrite factory"));
+        
+        // Create default rendering parameters
+        let render_params = factory.CreateRenderingParams()
+            .unwrap_or_else(|_| panic!("Failed to create rendering parameters"))
+            .cast::<IDWriteRenderingParams1>()
+            .unwrap_or_else(|_| panic!("Failed to cast to IDWriteRenderingParams1"));
+        
+        let gamma = render_params.GetGamma();
+        // Note: GetGrayscaleEnhancedContrast() is only available in IDWriteRenderingParams1+
+        // For compatibility, we'll use the regular enhanced contrast
+        let grayscale_enhanced_contrast = render_params.GetGrayscaleEnhancedContrast();
+        
+        // Use the sophisticated gamma calculation from dwrite-hlsl
+        let gamma_ratios = calculate_gamma_ratios(gamma);
+        
+        (gamma_ratios, grayscale_enhanced_contrast)
+    }
+}

@@ -626,6 +626,8 @@ impl Default for TransformationMatrix {
 #[repr(C)]
 pub(crate) struct MonochromeSprite {
     pub order: DrawOrder,
+    pub is_text: u32, // 1 if this is text rendering, 0 otherwise
+    pub is_thin_font: u32, // 1 if this is a thin font, 0 otherwise  
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
