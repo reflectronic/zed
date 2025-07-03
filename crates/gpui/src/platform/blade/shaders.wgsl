@@ -1194,12 +1194,9 @@ fn blend_text_color(color: vec4<f32>, alpha_factor: f32, is_text: bool, is_thin_
         // Convert foreground color to premultiplied alpha as expected by DirectWrite algorithm
         let premult_foreground = vec4<f32>(color.rgb * color.a, color.a);
         let blended = dwrite_grayscale_blend(
-            // globals.gamma_ratios,
-            vec4<f32>( 0.148054421f, -0.894594550f, 1.47590804f, -0.324668258f),
-            // globals.grayscale_enhanced_contrast,
-            1,
-            // is_thin_font,
-            false,
+            globals.gamma_ratios,
+            globals.grayscale_enhanced_contrast,
+            is_thin_font,
             premult_foreground,
             alpha_factor
         );

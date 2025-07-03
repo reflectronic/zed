@@ -32,34 +32,23 @@ const MEASURING_MODE: DWRITE_MEASURING_MODE = DWRITE_MEASURING_MODE_NATURAL;
 fn calculate_gamma_ratios(gamma: f32) -> [f32; 4] {
     // Pre-calculated gamma ratio lookup table for different gamma values (1.0 to 2.2)
     const GAMMA_RATIOS: [[f32; 4]; 13] = [
-        [0.0000f32 / 4.0, 0.0000f32 / 4.0, 0.0000f32 / 4.0, 0.0000f32 / 4.0], // gamma = 1.0
-        [0.0166f32 / 4.0, -0.0807f32 / 4.0, 0.2227f32 / 4.0, -0.0751f32 / 4.0], // gamma = 1.1
-        [0.0350f32 / 4.0, -0.1760f32 / 4.0, 0.4325f32 / 4.0, -0.1370f32 / 4.0], // gamma = 1.2
-        [0.0543f32 / 4.0, -0.2821f32 / 4.0, 0.6302f32 / 4.0, -0.1876f32 / 4.0], // gamma = 1.3
-        [0.0739f32 / 4.0, -0.3963f32 / 4.0, 0.8167f32 / 4.0, -0.2287f32 / 4.0], // gamma = 1.4
-        [0.0933f32 / 4.0, -0.5161f32 / 4.0, 0.9926f32 / 4.0, -0.2616f32 / 4.0], // gamma = 1.5
-        [0.1121f32 / 4.0, -0.6395f32 / 4.0, 1.1588f32 / 4.0, -0.2877f32 / 4.0], // gamma = 1.6
-        [0.1300f32 / 4.0, -0.7649f32 / 4.0, 1.3159f32 / 4.0, -0.3080f32 / 4.0], // gamma = 1.7
-        [0.1469f32 / 4.0, -0.8911f32 / 4.0, 1.4644f32 / 4.0, -0.3234f32 / 4.0], // gamma = 1.8
-        [0.1627f32 / 4.0, -1.0170f32 / 4.0, 1.6051f32 / 4.0, -0.3347f32 / 4.0], // gamma = 1.9
-        [0.1773f32 / 4.0, -1.1420f32 / 4.0, 1.7385f32 / 4.0, -0.3426f32 / 4.0], // gamma = 2.0
-        [0.1908f32 / 4.0, -1.2652f32 / 4.0, 1.8650f32 / 4.0, -0.3476f32 / 4.0], // gamma = 2.1
-        [0.2031f32 / 4.0, -1.3864f32 / 4.0, 1.9851f32 / 4.0, -0.3501f32 / 4.0], // gamma = 2.2
+        [ 0.0f32,              0.0f32,              0.0f32,              0.0f32 ], // gamma = 1.0
+        [ 0.002625f32  * 4.0, -0.0107f32   * 4.0, -0.3585f32   * 4.0, 0.18395f32  * 4.0 ], // gamma = 1.1
+        [ -0.000225f32 * 4.0, 0.00095f32   * 4.0, -0.32335f32  * 4.0, 0.16125f32  * 4.0 ],  // gamma = 1.2
+        [ -0.0023f32   * 4.0, 0.0098f32    * 4.0, -0.289175f32 * 4.0, 0.14025f32  * 4.0 ],  // gamma = 1.3
+        [ -0.003675f32 * 4.0, 0.0161f32    * 4.0, -0.25595f32  * 4.0, 0.12085f32  * 4.0 ],  // gamma = 1.4
+        [ -0.00445f32  * 4.0, 0.0201f32    * 4.0, -0.22365f32  * 4.0, 0.102875f32 * 4.0 ], // gamma = 1.5
+        [ -0.004725f32 * 4.0, 0.022025f32  * 4.0, -0.192225f32 * 4.0, 0.086275f32 * 4.0 ], // gamma = 1.6
+        [ -0.00455f32  * 4.0, 0.02205f32   * 4.0, -0.161675f32 * 4.0, 0.07095f32  * 4.0 ], // gamma = 1.7
+        [ -0.004f32    * 4.0, 0.0204f32    * 4.0, -0.13195f32  * 4.0, 0.056775f32 * 4.0 ], // gamma = 1.8
+        [ -0.0031f32   * 4.0, 0.017175f32  * 4.0, -0.10305f32  * 4.0, 0.043725f32 * 4.0 ], // gamma = 1.9
+        [ -0.00195f32  * 4.0, 0.012575f32  * 4.0, -0.07495f32  * 4.0, 0.031675f32 * 4.0 ], // gamma = 2.0
+        [ -0.00055f32  * 4.0, 0.00675f32   * 4.0, -0.0476f32   * 4.0, 0.020575f32 * 4.0 ], // gamma = 2.1
+        [ 0.00105f32   * 4.0, -0.000225f32 * 4.0, -0.021f32    * 4.0, 0.01035f32  * 4.0 ], // gamma = 2.2
     ];
-
-    const NORM13: f32 = (0x10000 as f64 / (255.0 * 255.0) * 4.0) as f32;
-    const NORM24: f32 = (0x100 as f64 / 255.0 * 4.0) as f32;
-
     // Clamp gamma to supported range and find table index
     let index = ((gamma * 10.0 + 0.5) as usize).clamp(10, 22) - 10;
-    let ratios = [0.1469f32 / 4.0, -0.8911f32 / 4.0, 1.4644f32 / 4.0, -0.3234f32 / 4.0];//GAMMA_RATIOS[index];
-
-    [
-        NORM13 * ratios[0], 
-        NORM24 * ratios[1],
-        NORM13 * ratios[2],
-        NORM24 * ratios[3],
-    ]
+    GAMMA_RATIOS[index]
 }
 
 /// List of font families that require special "thin font" treatment
@@ -135,25 +124,7 @@ impl DirectWriteComponent {
             let locale = String::from_utf16_lossy(&locale_vec);
             let text_renderer = Arc::new(TextRendererWrapper::new(&locale));
 
-            let default_params: IDWriteRenderingParams3 =
-                factory.CreateRenderingParams()?.cast()?;
-            let _gamma = default_params.GetGamma();
-            let _enhanced_contrast = default_params.GetEnhancedContrast();
-            let _gray_contrast = default_params.GetGrayscaleEnhancedContrast();
-            let cleartype_level = default_params.GetClearTypeLevel();
-            let grid_fit_mode = default_params.GetGridFitMode();
-
-            // Create linear rendering parameters to disable DirectWrite's internal gamma correction
-            // We'll do gamma correction in the shader instead for better quality
-            let render_params = factory.CreateCustomRenderingParams(
-                1.0,  // gamma: linear (no correction)
-                0.0,  // enhanced_contrast: no contrast boost
-                0.0,  // gray_contrast: no grayscale contrast boost
-                cleartype_level,
-                DWRITE_PIXEL_GEOMETRY_RGB,
-                DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
-                grid_fit_mode,
-            )?;
+            let render_params: IDWriteRenderingParams3 = factory.CreateRenderingParams()?.cast()?;
 
             Ok(DirectWriteComponent {
                 locale,
@@ -697,35 +668,7 @@ impl DirectWriteState {
             bidiLevel: 0,
         };
 
-        let subpixel_shift = params
-            .subpixel_variant
-            .map(|v| v as f32 / SUBPIXEL_VARIANTS as f32);
-
-        let glyph_analysis = unsafe {
-            let rendering_mode = self.components.render_params.GetRenderingMode1();
-            let grid_fit_mode = self.components.render_params.GetGridFitMode();
-
-            self.components
-                .factory
-                .CreateGlyphRunAnalysis(
-                    &glyph_run,
-                    Some(&DWRITE_MATRIX {
-                        m11: params.scale_factor,
-                        m12: 0.,
-                        m21: 0.,
-                        m22: params.scale_factor,
-                        dx: subpixel_shift.x,
-                        dy: subpixel_shift.y,
-                    }),
-                    rendering_mode,
-                    MEASURING_MODE,
-                    grid_fit_mode,
-                    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-                    0.,
-                    0.,
-                )
-                .unwrap()
-        };
+        let glyph_analysis = self.create_glyph_run_analysis(params, &glyph_run)?;
 
         let bounds = unsafe {
             glyph_analysis
@@ -790,13 +733,13 @@ impl DirectWriteState {
         };
 
         let mut size = glyph_bounds.size;
-        // Add an extra pixel when the subpixel variant isn't zero to make room for anti-aliasing.
-        if params.subpixel_variant.x > 0 {
-            size.width += DevicePixels(1);
-        }
-        if params.subpixel_variant.y > 0 {
-            size.height += DevicePixels(1);
-        }
+        // // Add an extra pixel when the subpixel variant isn't zero to make room for anti-aliasing.
+        // if params.subpixel_variant.x > 0 {
+        //     size.width += DevicePixels(1);
+        // }
+        // if params.subpixel_variant.y > 0 {
+        //     size.height += DevicePixels(1);
+        // }
 
         let subpixel_shift = params
             .subpixel_variant
@@ -911,31 +854,7 @@ impl DirectWriteState {
                 pixel[2] = (pixel[2] as f32 / a) as u8;
             }
         } else {
-            let glyph_analysis = unsafe {
-                let rendering_mode = self.components.render_params.GetRenderingMode1();
-                let grid_fit_mode = self.components.render_params.GetGridFitMode();
-
-                self.components
-                    .factory
-                    .CreateGlyphRunAnalysis(
-                        &glyph_run,
-                        Some(&DWRITE_MATRIX {
-                            m11: params.scale_factor,
-                            m12: 0.,
-                            m21: 0.,
-                            m22: params.scale_factor,
-                            dx: subpixel_shift.x,
-                            dy: subpixel_shift.y,
-                        }),
-                        rendering_mode,
-                        MEASURING_MODE,
-                        grid_fit_mode,
-                        DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
-                        0.,
-                        0.,
-                    )
-                    .unwrap()
-            };
+            let glyph_analysis = self.create_glyph_run_analysis(params, &glyph_run)?;
 
             let bounds = RECT {
                 left: 0,
@@ -1571,5 +1490,60 @@ pub fn get_dwrite_render_params() -> ([f32; 4], f32) {
         let gamma_ratios = calculate_gamma_ratios(gamma);
         
         (gamma_ratios, grayscale_enhanced_contrast)
+    }
+}
+
+impl DirectWriteState {
+    fn create_glyph_run_analysis(
+        &self,
+        params: &RenderGlyphParams,
+        glyph_run: &DWRITE_GLYPH_RUN,
+    ) -> Result<IDWriteGlyphRunAnalysis> {
+        let font_info = &self.fonts[params.font_id.0];
+        let subpixel_shift = params
+            .subpixel_variant
+            .map(|v| v as f32 / SUBPIXEL_VARIANTS as f32);
+
+        let transform = DWRITE_MATRIX {
+            m11: params.scale_factor,
+            m12: 0.,
+            m21: 0.,
+            m22: params.scale_factor,
+            dx: subpixel_shift.x,
+            dy: subpixel_shift.y,
+        };
+
+        unsafe {
+            // Get recommended rendering mode
+            let mut rendering_mode = DWRITE_RENDERING_MODE1_NATURAL;
+            let mut grid_fit_mode = DWRITE_GRID_FIT_MODE_DEFAULT;
+            let _ = font_info.font_face.GetRecommendedRenderingMode(
+                params.font_size.0,
+                96.0, // dpiX
+                96.0, // dpiY
+                None, //Some(&transform),
+                false,
+                DWRITE_OUTLINE_THRESHOLD_ALIASED,
+                MEASURING_MODE,
+                &self.components.render_params,
+                &mut rendering_mode,
+                &mut grid_fit_mode,
+            );
+            
+            // Create glyph run analysis
+            self.components
+                .factory
+                .CreateGlyphRunAnalysis(
+                    glyph_run,
+                    None, //Some(&transform),
+                    rendering_mode,
+                    MEASURING_MODE,
+                    grid_fit_mode,
+                    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                    0.,
+                    0.,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to create glyph run analysis: {}", e))
+        }
     }
 }
