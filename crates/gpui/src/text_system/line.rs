@@ -205,7 +205,7 @@ fn paint_line(
     );
     window.paint_layer(line_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
-        let baseline_offset = point(px(0.), padding_top + layout.ascent);
+        let baseline_offset = point(px(0.), (padding_top + layout.ascent).round());
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
@@ -221,8 +221,8 @@ fn paint_line(
                 &align,
                 layout,
                 wraps.peek(),
-            ),
-            origin.y,
+            ).round(),
+            origin.y.round(),
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
@@ -272,7 +272,7 @@ fn paint_line(
                         &align,
                         layout,
                         wraps.peek(),
-                    );
+                    ).round();
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -454,8 +454,8 @@ fn paint_line_background(
                 &align,
                 layout,
                 wraps.peek(),
-            ),
-            origin.y,
+            ).round(),
+            origin.y.round(),
         );
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
@@ -490,7 +490,7 @@ fn paint_line_background(
                         &align,
                         layout,
                         wraps.peek(),
-                    );
+                    ).round();
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;

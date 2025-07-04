@@ -733,13 +733,13 @@ impl DirectWriteState {
         };
 
         let mut size = glyph_bounds.size;
-        // // Add an extra pixel when the subpixel variant isn't zero to make room for anti-aliasing.
-        // if params.subpixel_variant.x > 0 {
-        //     size.width += DevicePixels(1);
-        // }
-        // if params.subpixel_variant.y > 0 {
-        //     size.height += DevicePixels(1);
-        // }
+        // Add an extra pixel when the subpixel variant isn't zero to make room for anti-aliasing.
+        if params.subpixel_variant.x > 0 {
+            size.width += DevicePixels(1);
+        }
+        if params.subpixel_variant.y > 0 {
+            size.height += DevicePixels(1);
+        }
 
         let subpixel_shift = params
             .subpixel_variant
@@ -1521,7 +1521,7 @@ impl DirectWriteState {
                 params.font_size.0,
                 96.0, // dpiX
                 96.0, // dpiY
-                None, //Some(&transform),
+                Some(&transform),
                 false,
                 DWRITE_OUTLINE_THRESHOLD_ALIASED,
                 MEASURING_MODE,
@@ -1535,7 +1535,7 @@ impl DirectWriteState {
                 .factory
                 .CreateGlyphRunAnalysis(
                     glyph_run,
-                    None, //Some(&transform),
+                    Some(&transform),
                     rendering_mode,
                     MEASURING_MODE,
                     grid_fit_mode,

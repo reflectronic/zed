@@ -2715,8 +2715,8 @@ impl Window {
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
         let subpixel_variant = Point {
-            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
-            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS as f32).floor() as u8,
+            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS as f32).round() as u8,
+            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS as f32).round() as u8,
         };
         let params = RenderGlyphParams {
             font_id,
