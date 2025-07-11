@@ -1181,7 +1181,7 @@ fn dwrite_unpremultiply_color(color: vec4<f32>) -> vec3<f32> {
 fn dwrite_grayscale_blend(gamma_ratios: vec4<f32>, grayscale_enhanced_contrast: f32, 
                          is_thin_font: bool, foreground_color: vec4<f32>, glyph_alpha: f32) -> vec4<f32> {
     let foreground_straight = dwrite_unpremultiply_color(foreground_color);
-    let contrast_boost   = select(0.0, 0.5, is_thin_font);
+    let contrast_boost = select(0.0, 0.5, is_thin_font);
     let blend_enhanced_contrast = contrast_boost + dwrite_apply_light_on_dark_contrast_adjustment(grayscale_enhanced_contrast, foreground_straight);
     let intensity = dwrite_calc_color_intensity(foreground_color.rgb);
     let contrasted = dwrite_enhance_contrast(glyph_alpha, blend_enhanced_contrast);

@@ -221,7 +221,7 @@ fn paint_line(
                 &align,
                 layout,
                 wraps.peek(),
-            ).round(),
+            ),
             origin.y.round(),
         );
         let mut prev_glyph_position = Point::default();
@@ -272,7 +272,7 @@ fn paint_line(
                         &align,
                         layout,
                         wraps.peek(),
-                    ).round();
+                    );
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -454,7 +454,7 @@ fn paint_line_background(
                 &align,
                 layout,
                 wraps.peek(),
-            ).round(),
+            ),
             origin.y.round(),
         );
         let mut prev_glyph_position = Point::default();
@@ -490,7 +490,7 @@ fn paint_line_background(
                         &align,
                         layout,
                         wraps.peek(),
-                    ).round();
+                    );
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
