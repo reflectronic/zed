@@ -3,9 +3,13 @@ use blade_graphics as gpu;
 use std::sync::Arc;
 use util::ResultExt;
 
+use super::BladeAtlas;
+
 #[cfg_attr(target_os = "macos", derive(Clone))]
 pub struct BladeContext {
     pub(super) gpu: Arc<gpu::Context>,
+    pub(super) atlas: Arc<BladeAtlas>,
+    pub(super) atlas_sampler: gpu::Sampler,
 }
 
 impl BladeContext {
@@ -32,7 +36,20 @@ impl BladeContext {
             }
             .map_err(|e| anyhow::anyhow!("{e:?}"))?,
         );
-        Ok(Self { gpu })
+
+        let atlas = Arc::new(BladeAtlas::new(&gpu));
+        let atlas_sampler = gpu.create_sampler(gpu::SamplerDesc {
+            name: "path rasterization sampler",
+            mag_filter: gpu::FilterMode::Linear,
+            min_filter: gpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        Ok(Self {
+            gpu,
+            atlas,
+            atlas_sampler,
+        })
     }
 }
 

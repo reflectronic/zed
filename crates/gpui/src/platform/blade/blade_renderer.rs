@@ -378,13 +378,8 @@ impl BladeRenderer {
             min_chunk_size: 0x1000,
             alignment: 0x40, // Vulkan `minStorageBufferOffsetAlignment` on Intel Xe
         });
-        let atlas = Arc::new(BladeAtlas::new(&context.gpu));
-        let atlas_sampler = context.gpu.create_sampler(gpu::SamplerDesc {
-            name: "path rasterization sampler",
-            mag_filter: gpu::FilterMode::Linear,
-            min_filter: gpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let atlas = Arc::clone(&context.atlas);
+        let atlas_sampler = context.atlas_sampler;
 
         let (path_intermediate_texture, path_intermediate_texture_view) =
             create_path_intermediate_texture(
@@ -624,8 +619,6 @@ impl BladeRenderer {
 
     pub fn destroy(&mut self) {
         self.wait_for_gpu();
-        self.atlas.destroy();
-        self.gpu.destroy_sampler(self.atlas_sampler);
         self.instance_belt.destroy(&self.gpu);
         self.gpu.destroy_command_encoder(&mut self.command_encoder);
         self.pipelines.destroy(&self.gpu);
