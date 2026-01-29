@@ -19,7 +19,9 @@ use remote::{
 pub use settings::SshConnection;
 use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
 use util::paths::PathWithPosition;
-use workspace::{AppState, Workspace};
+use workspace::{
+    AppState, OpenOptions, SerializedWorkspaceLocation, Workspace, find_existing_workspace,
+};
 
 pub use remote_connection::{
     RemoteClientDelegate, RemoteConnectionModal, RemoteConnectionPrompt, SshConnectionHeader,
@@ -131,6 +133,44 @@ pub async fn open_remote_project(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let created_new_window = open_options.replace_window.is_none();
+
+    let (existing, open_visible) = find_existing_workspace(
+        &paths,
+        &app_state,
+        &open_options,
+        &SerializedWorkspaceLocation::Remote(connection_options.clone()),
+        cx,
+    )
+    .await;
+
+    if let Some(existing) = existing {
+        let open_results = existing
+            .update(cx, |workspace, window, cx| {
+                window.activate_window();
+                workspace.open_paths(
+                    paths,
+                    OpenOptions {
+                        visible: Some(open_visible),
+                        ..Default::default()
+                    },
+                    None,
+                    window,
+                    cx,
+                )
+            })?
+            .await;
+
+        _ = existing.update(cx, |workspace, _, cx| {
+            for item in open_results.iter().flatten() {
+                if let Err(e) = item {
+                    workspace.show_error(&e, cx);
+                }
+            }
+        });
+
+        return Ok(());
+    }
+
     let window = if let Some(window) = open_options.replace_window {
         window
     } else {

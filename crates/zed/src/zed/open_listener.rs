@@ -527,63 +527,81 @@ async fn open_workspaces(
                 .detach();
             });
         }
-    } else {
-        // If there are paths to open, open a workspace for each grouping of paths
-        let mut errored = false;
+        return Ok(());
+    }
+    // If there are paths to open, open a workspace for each grouping of paths
+    let mut errored = false;
 
-        for (location, workspace_paths) in grouped_locations {
-            match location {
-                SerializedWorkspaceLocation::Local => {
-                    let workspace_paths = workspace_paths
-                        .paths()
-                        .iter()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .collect();
+    for (location, workspace_paths) in grouped_locations {
+        // If reuse flag is passed, open a new workspace in an existing window.
+        let (open_new_workspace, replace_window) = if reuse {
+            (
+                Some(true),
+                cx.update(|cx| {
+                    workspace::workspace_windows_for_location(&location, cx)
+                        .into_iter()
+                        .next()
+                }),
+            )
+        } else {
+            (open_new_workspace, None)
+        };
+        let open_options = workspace::OpenOptions {
+            open_new_workspace,
+            replace_window,
+            wait,
+            env: env.clone(),
+            ..Default::default()
+        };
 
-                    let workspace_failed_to_open = open_local_workspace(
-                        workspace_paths,
-                        diff_paths.clone(),
-                        diff_all,
-                        open_new_workspace,
-                        reuse,
-                        wait,
-                        responses,
-                        env.as_ref(),
-                        &app_state,
-                        cx,
-                    )
-                    .await;
+        match location {
+            SerializedWorkspaceLocation::Local => {
+                let workspace_paths = workspace_paths
+                    .paths()
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
 
-                    if workspace_failed_to_open {
-                        errored = true
-                    }
-                }
-                SerializedWorkspaceLocation::Remote(mut connection) => {
-                    let app_state = app_state.clone();
-                    if let RemoteConnectionOptions::Ssh(options) = &mut connection {
-                        cx.update(|cx| {
-                            RemoteSettings::get_global(cx)
-                                .fill_connection_options_from_settings(options)
-                        });
-                    }
-                    cx.spawn(async move |cx| {
-                        open_remote_project(
-                            connection,
-                            workspace_paths.paths().to_vec(),
-                            app_state,
-                            OpenOptions::default(),
-                            cx,
-                        )
-                        .await
-                        .log_err();
-                    })
-                    .detach();
+                let workspace_failed_to_open = open_local_workspace(
+                    workspace_paths,
+                    diff_paths.clone(),
+                    diff_all,
+                    open_options,
+                    responses,
+                    &app_state,
+                    cx,
+                )
+                .await;
+
+                if workspace_failed_to_open {
+                    errored = true
                 }
             }
+            SerializedWorkspaceLocation::Remote(mut connection) => {
+                let app_state = app_state.clone();
+                if let RemoteConnectionOptions::Ssh(options) = &mut connection {
+                    cx.update(|cx| {
+                        RemoteSettings::get_global(cx)
+                            .fill_connection_options_from_settings(options)
+                    });
+                }
+                cx.spawn(async move |cx| {
+                    open_remote_project(
+                        connection,
+                        workspace_paths.paths().to_vec(),
+                        app_state,
+                        open_options,
+                        cx,
+                    )
+                    .await
+                    .log_err();
+                })
+                .detach();
+            }
         }
-
-        anyhow::ensure!(!errored, "failed to open a workspace");
     }
+
+    anyhow::ensure!(!errored, "failed to open a workspace");
 
     Ok(())
 }
@@ -592,39 +610,20 @@ async fn open_local_workspace(
     workspace_paths: Vec<String>,
     diff_paths: Vec<[String; 2]>,
     diff_all: bool,
-    open_new_workspace: Option<bool>,
-    reuse: bool,
-    wait: bool,
+    open_options: workspace::OpenOptions,
     responses: &IpcSender<CliResponse>,
-    env: Option<&HashMap<String, String>>,
     app_state: &Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> bool {
     let paths_with_position =
         derive_paths_with_position(app_state.fs.as_ref(), workspace_paths).await;
 
-    // If reuse flag is passed, open a new workspace in an existing window.
-    let (open_new_workspace, replace_window) = if reuse {
-        (
-            Some(true),
-            cx.update(|cx| workspace::local_workspace_windows(cx).into_iter().next()),
-        )
-    } else {
-        (open_new_workspace, None)
-    };
-
     let (workspace, items) = match open_paths_with_positions(
         &paths_with_position,
         &diff_paths,
         diff_all,
         app_state.clone(),
-        workspace::OpenOptions {
-            open_new_workspace,
-            replace_window,
-            prefer_focused_window: wait,
-            env: env.cloned(),
-            ..Default::default()
-        },
+        open_options.clone(),
         cx,
     )
     .await
@@ -643,10 +642,9 @@ async fn open_local_workspace(
     let mut errored = false;
     let mut item_release_futures = Vec::new();
     let mut subscriptions = Vec::new();
-
     // If --wait flag is used with no paths, or a directory, then wait until
     // the entire workspace is closed.
-    if wait {
+    if open_options.wait {
         let mut wait_for_window_close = paths_with_position.is_empty() && diff_paths.is_empty();
         for path_with_position in &paths_with_position {
             if app_state.fs.is_dir(&path_with_position.path).await {
@@ -669,7 +667,7 @@ async fn open_local_workspace(
     for item in items {
         match item {
             Some(Ok(item)) => {
-                if wait {
+                if open_options.wait {
                     let (release_tx, release_rx) = oneshot::channel();
                     item_release_futures.push(release_rx);
                     subscriptions.push(Ok(cx.update(|cx| {
@@ -694,7 +692,7 @@ async fn open_local_workspace(
         }
     }
 
-    if wait {
+    if open_options.wait {
         let wait = async move {
             let _subscriptions = subscriptions;
             let _ = future::try_join_all(item_release_futures).await;
@@ -755,7 +753,7 @@ mod tests {
     use serde_json::json;
     use std::{sync::Arc, task::Poll};
     use util::path;
-    use workspace::{AppState, Workspace};
+    use workspace::{AppState, Workspace, find_existing_workspace};
 
     #[gpui::test]
     fn test_parse_ssh_url(cx: &mut TestAppContext) {
@@ -957,11 +955,11 @@ mod tests {
                     workspace_paths,
                     vec![],
                     false,
-                    None,
-                    false,
-                    true,
+                    workspace::OpenOptions {
+                        wait: true,
+                        ..Default::default()
+                    },
                     &response_tx,
-                    None,
                     &app_state,
                     &mut cx,
                 )
@@ -1049,11 +1047,11 @@ mod tests {
                     workspace_paths,
                     vec![],
                     false,
-                    open_new_workspace,
-                    false,
-                    false,
+                    OpenOptions {
+                        open_new_workspace,
+                        ..Default::default()
+                    },
                     &response_tx,
-                    None,
                     &app_state,
                     &mut cx,
                 )
@@ -1123,11 +1121,8 @@ mod tests {
                         workspace_paths,
                         vec![],
                         false,
-                        None,
-                        false,
-                        false,
+                        workspace::OpenOptions::default(),
                         &response_tx,
-                        None,
                         &app_state,
                         &mut cx,
                     )
@@ -1138,6 +1133,16 @@ mod tests {
 
         // Now test the reuse functionality - should replace the existing workspace
         let workspace_paths_reuse = vec![file1_path.to_string()];
+        let window_to_replace = find_existing_workspace(
+            paths,
+            &app_state,
+            &workspace::OpenOptions::default(),
+            &workspace::SerializedWorkspaceLocation::Local,
+            &mut cx.to_async(),
+        )
+        .await
+        .0
+        .unwrap();
 
         let errored_reuse = cx
             .spawn({
@@ -1148,11 +1153,11 @@ mod tests {
                         workspace_paths_reuse,
                         vec![],
                         false,
-                        None, // open_new_workspace will be overridden by reuse logic
-                        true, // reuse = true
-                        false,
+                        workspace::OpenOptions {
+                            replace_window: Some(window_to_replace),
+                            ..Default::default()
+                        },
                         &response_tx,
-                        None,
                         &app_state,
                         &mut cx,
                     )
