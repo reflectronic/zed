@@ -8436,10 +8436,15 @@ pub async fn open_paths_with_workspace_factory(
     workspace_factory: impl FnOnce(Vec<PathBuf>, &mut App) -> Task<anyhow::Result<OpenedItems>>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<OpenedItems> {
+    #[cfg(target_os = "windows")]
+    let wsl_path = abs_paths
+        .iter()
+        .find_map(|p| util::paths::WslPath::from_path(p));
+
     let (existing, open_visible) =
         find_existing_workspace(&abs_paths, open_options, location, cx).await;
 
-    if let Some(workspace) = existing {
+    let result = if let Some(workspace) = existing {
         let items = workspace
             .update(cx, |workspace, window, cx| {
                 window.activate_window();
@@ -8467,7 +8472,38 @@ pub async fn open_paths_with_workspace_factory(
         Ok(OpenedItems { workspace, items })
     } else {
         cx.update(|cx| workspace_factory(abs_paths, cx)).await
-    }
+    };
+
+    #[cfg(target_os = "windows")]
+    if let Some(util::paths::WslPath { distro, path }) = wsl_path
+        && let Ok(OpenedItems { workspace, .. }) = &result
+    {
+        workspace
+            .update(cx, move |workspace, _window, cx| {
+                struct OpenInWsl;
+                workspace.show_notification(NotificationId::unique::<OpenInWsl>(), cx, move |cx| {
+                    let display_path = util::markdown::MarkdownInlineCode(&path.to_string_lossy());
+                    let msg = format!("{display_path} is inside a WSL filesystem, some features may not work unless you open it with WSL remote");
+                    cx.new(move |cx| {
+                        MessageNotification::new(msg, cx)
+                            .primary_message("Open in WSL")
+                            .primary_icon(IconName::FolderOpen)
+                            .primary_on_click(move |window, cx| {
+                                window.dispatch_action(Box::new(remote::OpenWslPath {
+                                        distro: remote::WslConnectionOptions {
+                                                distro_name: distro.clone(),
+                                            user: None,
+                                        },
+                                        paths: vec![path.clone().into()],
+                                    }), cx)
+                            })
+                    })
+                });
+            })
+            .unwrap();
+    };
+
+    result
 }
 
 pub fn open_new(
