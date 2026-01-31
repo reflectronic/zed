@@ -55,6 +55,10 @@ pub use item::{
     FollowableItem, FollowableItemHandle, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
     ProjectItem, SerializableItem, SerializableItemHandle, WeakItemHandle,
 };
+pub type OpenedWorkspace = (
+    WindowHandle<Workspace>,
+    Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
+);
 use itertools::Itertools;
 use language::{Buffer, LanguageRegistry, Rope, language_settings::all_language_settings};
 pub use modal_layer::*;
@@ -8287,7 +8291,6 @@ pub fn open_workspace_by_id(
 
 pub async fn find_existing_workspace(
     abs_paths: &[PathBuf],
-    app_state: &Arc<AppState>,
     open_options: &OpenOptions,
     location: &SerializedWorkspaceLocation,
     cx: &mut AsyncApp,
@@ -8295,21 +8298,13 @@ pub async fn find_existing_workspace(
     let mut existing = None;
     let mut open_visible = OpenVisible::All;
     let mut best_match = None;
-
     if open_options.open_new_workspace != Some(true) {
-        let all_paths = abs_paths.iter().map(|path| app_state.fs.metadata(path));
-        let all_metadatas = futures::future::join_all(all_paths)
-            .await
-            .into_iter()
-            .filter_map(|result| result.ok().flatten())
-            .collect::<Vec<_>>();
-
         cx.update(|cx| {
             for window in workspace_windows_for_location(location, cx) {
                 if let Ok(workspace) = window.read(cx) {
-                    let m = workspace.project.read(cx).visibility_for_paths(
-                        &abs_paths,
-                        &all_metadatas,
+                    let project = workspace.project.read(cx);
+                    let m = project.visibility_for_paths(
+                        abs_paths,
                         open_options.open_new_workspace == None,
                         cx,
                     );
@@ -8318,15 +8313,39 @@ pub async fn find_existing_workspace(
                         best_match = m;
                     } else if best_match.is_none() && open_options.open_new_workspace == Some(false)
                     {
-                        existing = Some(window)
+                        existing = Some(window);
                     }
                 }
             }
         });
 
+        let all_paths_are_files = cx
+            .update(|cx| {
+                existing.and_then(|workspace| {
+                    workspace
+                        .read(cx)
+                        .map(|workspace| {
+                            let project = workspace.project.read(cx);
+                            let path_style = workspace.path_style(cx);
+                            !abs_paths.iter().any(|path| {
+                                project.worktrees(cx).any(|worktree| {
+                                    let worktree = worktree.read(cx);
+                                    let abs_path = worktree.abs_path();
+                                    path_style
+                                        .strip_prefix(path, abs_path.as_ref())
+                                        .and_then(|rel| worktree.entry_for_path(&rel))
+                                        .is_some_and(|e| e.is_dir())
+                                })
+                            })
+                        })
+                        .ok()
+                })
+            })
+            .unwrap_or(false);
+
         if open_options.open_new_workspace.is_none()
             && (existing.is_none() || open_options.wait)
-            && all_metadatas.iter().all(|file| !file.is_dir)
+            && all_paths_are_files
         {
             cx.update(|cx| {
                 // Only fall back to active local window when opening local paths.
@@ -8357,17 +8376,63 @@ pub async fn find_existing_workspace(
 }
 
 #[allow(clippy::type_complexity)]
+pub async fn open_paths_with_creator(
+    abs_paths: Vec<PathBuf>,
+    location: &SerializedWorkspaceLocation,
+    open_options: &OpenOptions,
+    create_workspace_with_paths: impl FnOnce(
+        Vec<PathBuf>,
+        &mut App,
+    ) -> Task<
+        anyhow::Result<(
+            WindowHandle<Workspace>,
+            Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
+        )>,
+    >,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<OpenedWorkspace> {
+    let (existing, open_visible) =
+        find_existing_workspace(&abs_paths, open_options, location, cx).await;
+
+    if let Some(existing) = existing {
+        let open_task = existing
+            .update(cx, |workspace, window, cx| {
+                window.activate_window();
+                workspace.open_paths(
+                    abs_paths,
+                    OpenOptions {
+                        visible: Some(open_visible),
+                        ..Default::default()
+                    },
+                    None,
+                    window,
+                    cx,
+                )
+            })?
+            .await;
+
+        _ = existing.update(cx, |workspace, _, cx| {
+            for item in open_task.iter().flatten() {
+                if let Err(e) = item {
+                    workspace.show_error(&e, cx);
+                }
+            }
+        });
+
+        Ok((existing, open_task))
+    } else {
+        cx.update(|cx| create_workspace_with_paths(abs_paths, cx))
+            .await
+    }
+}
+
+#[allow(clippy::type_complexity)]
 pub fn open_paths(
     abs_paths: &[PathBuf],
     app_state: Arc<AppState>,
     open_options: OpenOptions,
     cx: &mut App,
-) -> Task<
-    anyhow::Result<(
-        WindowHandle<Workspace>,
-        Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
-    )>,
-> {
+) -> Task<anyhow::Result<OpenedWorkspace>> {
     let abs_paths = abs_paths.to_vec();
     #[cfg(target_os = "windows")]
     let wsl_path = abs_paths
@@ -8375,47 +8440,22 @@ pub fn open_paths(
         .find_map(|p| util::paths::WslPath::from_path(p));
 
     cx.spawn(async move |cx| {
-        let (existing, open_visible) = find_existing_workspace(&abs_paths, &app_state, &open_options, &SerializedWorkspaceLocation::Local, cx).await;
-
-        let result = if let Some(existing) = existing {
-            let open_task = existing
-                .update(cx, |workspace, window, cx| {
-                    window.activate_window();
-                    workspace.open_paths(
-                        abs_paths,
-                        OpenOptions {
-                            visible: Some(open_visible),
-                            ..Default::default()
-                        },
-                        None,
-                        window,
-                        cx,
-                    )
-                })?
-                .await;
-
-            _ = existing.update(cx, |workspace, _, cx| {
-                for item in open_task.iter().flatten() {
-                    if let Err(e) = item {
-                        workspace.show_error(&e, cx);
-                    }
-                }
-            });
-
-            Ok((existing, open_task))
-        } else {
-            cx.update(move |cx| {
+        let result = open_paths_with_creator(
+            abs_paths,
+            &SerializedWorkspaceLocation::Local,            &open_options,
+            |paths, cx| {
                 Workspace::new_local(
-                    abs_paths,
+                    paths,
                     app_state.clone(),
-                    open_options.replace_window,
-                    open_options.env,
+                    open_options.replace_window.clone(),
+                    open_options.env.clone(),
                     None,
                     cx,
                 )
-            })
-            .await
-        };
+            },
+            cx,
+        )
+        .await;
 
         #[cfg(target_os = "windows")]
         if let Some(util::paths::WslPath{distro, path}) = wsl_path

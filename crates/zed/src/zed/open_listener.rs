@@ -30,7 +30,7 @@ use util::ResultExt;
 use util::paths::PathWithPosition;
 use workspace::PathList;
 use workspace::item::ItemHandle;
-use workspace::{AppState, OpenOptions, SerializedWorkspaceLocation, Workspace};
+use workspace::{AppState, OpenOptions, OpenedWorkspace, SerializedWorkspaceLocation, Workspace};
 
 #[derive(Default, Debug)]
 pub struct OpenRequest {
@@ -329,17 +329,83 @@ fn connect_to_cli(
     Ok((async_request_rx, response_tx))
 }
 
+pub async fn open_paths_for_location(
+    paths_with_position: &[PathWithPosition],
+    diff_paths: &[[String; 2]],
+    diff_all: bool,
+    location: &SerializedWorkspaceLocation,
+    app_state: &Arc<AppState>,
+    open_options: &OpenOptions,
+    cx: &mut AsyncApp,
+) -> Result<OpenedWorkspace> {
+    match location {
+        SerializedWorkspaceLocation::Local => {
+            open_paths_with_positions(
+                paths_with_position,
+                diff_paths,
+                diff_all,
+                location,
+                open_options,
+                |paths, cx| {
+                    Workspace::new_local(
+                        paths,
+                        app_state.clone(),
+                        open_options.replace_window.clone(),
+                        open_options.env.clone(),
+                        None,
+                        cx,
+                    )
+                },
+                cx,
+            )
+            .await
+        }
+        SerializedWorkspaceLocation::Remote(connection) => {
+            let mut connection = connection.clone();
+            if let RemoteConnectionOptions::Ssh(options) = &mut connection {
+                cx.update(|cx| {
+                    RemoteSettings::get_global(cx).fill_connection_options_from_settings(options)
+                });
+            }
+            open_paths_with_positions(
+                paths_with_position,
+                diff_paths,
+                diff_all,
+                location,
+                open_options,
+                |paths, cx| {
+                    let connection = connection.clone();
+                    let app_state = app_state.clone();
+                    let open_options = open_options.clone();
+                    cx.spawn(async move |cx| {
+                        open_remote_project(connection, paths, app_state, open_options, cx).await
+                    })
+                },
+                cx,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
 pub async fn open_paths_with_positions(
     path_positions: &[PathWithPosition],
     diff_paths: &[[String; 2]],
     diff_all: bool,
-    app_state: Arc<AppState>,
-    open_options: workspace::OpenOptions,
+    location: &SerializedWorkspaceLocation,
+    open_options: &OpenOptions,
+    create_workspace_with_paths: impl FnOnce(
+        Vec<PathBuf>,
+        &mut gpui::App,
+    ) -> gpui::Task<
+        anyhow::Result<(
+            WindowHandle<Workspace>,
+            Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
+        )>,
+    >,
     cx: &mut AsyncApp,
-) -> Result<(
-    WindowHandle<Workspace>,
-    Vec<Option<Result<Box<dyn ItemHandle>>>>,
-)> {
+) -> Result<OpenedWorkspace> {
     let mut caret_positions = HashMap::default();
 
     let paths = path_positions
@@ -357,9 +423,14 @@ pub async fn open_paths_with_positions(
         })
         .collect::<Vec<_>>();
 
-    let (workspace, mut items) = cx
-        .update(|cx| workspace::open_paths(&paths, app_state, open_options, cx))
-        .await?;
+    let (workspace, mut items) = workspace::open_paths_with_creator(
+        paths.clone(),
+        location,
+        open_options,
+        create_workspace_with_paths,
+        cx,
+    )
+    .await?;
 
     if diff_all && !diff_paths.is_empty() {
         if let Ok(diff_view) = workspace.update(cx, |workspace, window, cx| {
@@ -554,49 +625,50 @@ async fn open_workspaces(
             ..Default::default()
         };
 
-        match location {
-            SerializedWorkspaceLocation::Local => {
-                let workspace_paths = workspace_paths
-                    .paths()
-                    .iter()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .collect();
+        let workspace_paths_strings: Vec<String> = workspace_paths
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let paths_with_position =
+            derive_paths_with_position(app_state.fs.as_ref(), &workspace_paths_strings).await;
 
-                let workspace_failed_to_open = open_local_workspace(
-                    workspace_paths,
-                    diff_paths.clone(),
-                    diff_all,
-                    open_options,
+        let result = open_paths_for_location(
+            &paths_with_position,
+            &diff_paths,
+            diff_all,
+            &location,
+            &app_state,
+            &open_options,
+            cx,
+        )
+        .await;
+
+        match result {
+            Ok((workspace, items)) => {
+                // Handle CLI wait/responses for both local and remote
+                let workspace_failed = handle_cli_items(
+                    workspace,
+                    items,
+                    &paths_with_position,
+                    &diff_paths,
+                    open_options.wait,
                     responses,
                     &app_state,
                     cx,
                 )
                 .await;
-
-                if workspace_failed_to_open {
-                    errored = true
+                if workspace_failed {
+                    errored = true;
                 }
             }
-            SerializedWorkspaceLocation::Remote(mut connection) => {
-                let app_state = app_state.clone();
-                if let RemoteConnectionOptions::Ssh(options) = &mut connection {
-                    cx.update(|cx| {
-                        RemoteSettings::get_global(cx)
-                            .fill_connection_options_from_settings(options)
-                    });
-                }
-                cx.spawn(async move |cx| {
-                    open_remote_project(
-                        connection,
-                        workspace_paths.paths().to_vec(),
-                        app_state,
-                        open_options,
-                        cx,
-                    )
-                    .await
+            Err(error) => {
+                responses
+                    .send(CliResponse::Stderr {
+                        message: format!("error opening {:?}: {error}", paths_with_position),
+                    })
                     .log_err();
-                })
-                .detach();
+                errored = true;
             }
         }
     }
@@ -606,47 +678,24 @@ async fn open_workspaces(
     Ok(())
 }
 
-async fn open_local_workspace(
-    workspace_paths: Vec<String>,
-    diff_paths: Vec<[String; 2]>,
-    diff_all: bool,
-    open_options: workspace::OpenOptions,
+async fn handle_cli_items(
+    workspace: WindowHandle<Workspace>,
+    items: Vec<Option<Result<Box<dyn ItemHandle>>>>,
+    paths_with_position: &[PathWithPosition],
+    diff_paths: &[[String; 2]],
+    wait: bool,
     responses: &IpcSender<CliResponse>,
     app_state: &Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> bool {
-    let paths_with_position =
-        derive_paths_with_position(app_state.fs.as_ref(), workspace_paths).await;
-
-    let (workspace, items) = match open_paths_with_positions(
-        &paths_with_position,
-        &diff_paths,
-        diff_all,
-        app_state.clone(),
-        open_options.clone(),
-        cx,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            responses
-                .send(CliResponse::Stderr {
-                    message: format!("error opening {paths_with_position:?}: {error}"),
-                })
-                .log_err();
-            return true;
-        }
-    };
-
     let mut errored = false;
     let mut item_release_futures = Vec::new();
     let mut subscriptions = Vec::new();
     // If --wait flag is used with no paths, or a directory, then wait until
     // the entire workspace is closed.
-    if open_options.wait {
+    if wait {
         let mut wait_for_window_close = paths_with_position.is_empty() && diff_paths.is_empty();
-        for path_with_position in &paths_with_position {
+        for path_with_position in paths_with_position.iter() {
             if app_state.fs.is_dir(&path_with_position.path).await {
                 wait_for_window_close = true;
                 break;
@@ -667,7 +716,7 @@ async fn open_local_workspace(
     for item in items {
         match item {
             Some(Ok(item)) => {
-                if open_options.wait {
+                if wait {
                     let (release_tx, release_rx) = oneshot::channel();
                     item_release_futures.push(release_rx);
                     subscriptions.push(Ok(cx.update(|cx| {
@@ -692,7 +741,7 @@ async fn open_local_workspace(
         }
     }
 
-    if open_options.wait {
+    if wait {
         let wait = async move {
             let _subscriptions = subscriptions;
             let _ = future::try_join_all(item_release_futures).await;
@@ -720,12 +769,12 @@ async fn open_local_workspace(
 }
 
 pub async fn derive_paths_with_position(
-    fs: &dyn Fs,
+    _fs: &dyn Fs,
     path_strings: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Vec<PathWithPosition> {
     join_all(path_strings.into_iter().map(|path_str| async move {
-        let canonicalized = fs.canonicalize(Path::new(path_str.as_ref())).await;
-        (path_str, canonicalized)
+        // let canonicalized = fs.canonicalize(Path::new(path_str.as_ref())).await;
+        (path_str, Err::<PathBuf, ()>(()))
     }))
     .await
     .into_iter()

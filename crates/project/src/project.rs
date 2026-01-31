@@ -2307,14 +2307,12 @@ impl Project {
     pub fn visibility_for_paths(
         &self,
         paths: &[PathBuf],
-        metadatas: &[Metadata],
         exclude_sub_dirs: bool,
         cx: &App,
     ) -> Option<bool> {
         paths
             .iter()
-            .zip(metadatas)
-            .map(|(path, metadata)| self.visibility_for_path(path, metadata, exclude_sub_dirs, cx))
+            .map(|path| self.visibility_for_path(path, exclude_sub_dirs, cx))
             .max()
             .flatten()
     }
@@ -2322,17 +2320,20 @@ impl Project {
     pub fn visibility_for_path(
         &self,
         path: &Path,
-        metadata: &Metadata,
         exclude_sub_dirs: bool,
         cx: &App,
     ) -> Option<bool> {
-        let path = SanitizedPath::new(path).as_path();
+        let path_style = self.path_style(cx);
         self.worktrees(cx)
             .filter_map(|worktree| {
                 let worktree = worktree.read(cx);
-                let abs_path = worktree.as_local()?.abs_path();
-                let contains = path == abs_path.as_ref()
-                    || (path.starts_with(abs_path) && (!exclude_sub_dirs || !metadata.is_dir));
+                let abs_path = worktree.abs_path();
+                let relative_path = path_style.strip_prefix(path, abs_path.as_ref());
+                let is_dir = relative_path
+                    .as_ref()
+                    .and_then(|p| worktree.entry_for_path(p))
+                    .is_some_and(|e| e.is_dir());
+                let contains = relative_path.is_some() && (!exclude_sub_dirs || !is_dir);
                 contains.then(|| worktree.is_visible())
             })
             .max()

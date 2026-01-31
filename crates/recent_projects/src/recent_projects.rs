@@ -12,7 +12,7 @@ mod wsl_picker;
 use dev_container::start_dev_container;
 use remote::RemoteConnectionOptions;
 pub use remote_connection::{RemoteConnectionModal, connect};
-pub use remote_connections::open_remote_project;
+pub use remote_connections::{determine_paths_with_positions, open_remote_project};
 
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy::{StringMatch, StringMatchCandidate};
@@ -194,6 +194,7 @@ pub fn init(cx: &mut App) {
                     cx,
                 )
                 .await
+                .map(|_| ())
             })
             .detach();
         });
@@ -675,6 +676,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 cx,
                             )
                             .await
+                            .map(|_| ())
                         })
                     }
                 }

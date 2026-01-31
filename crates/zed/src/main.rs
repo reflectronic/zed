@@ -31,12 +31,13 @@ use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
 use reqwest_client::ReqwestClient;
 
+use crate::zed::{OpenRequestKind, eager_load_active_theme_and_icon_theme};
 use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::{project_settings::ProjectSettings, trusted_worktrees};
 use proto;
-use recent_projects::{RemoteSettings, open_remote_project};
+use recent_projects::RemoteSettings;
 use release_channel::{AppCommitSha, AppVersion};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
@@ -61,10 +62,8 @@ use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
     derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
     handle_keymap_file_changes, handle_settings_file_changes, initialize_workspace,
-    open_paths_with_positions,
+    open_paths_for_location,
 };
-
-use crate::zed::{OpenRequestKind, eager_load_active_theme_and_icon_theme};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -1056,12 +1055,14 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 cx.spawn(async move |cx| {
                     let paths_with_position =
                         derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
-                    let (workspace, _results) = open_paths_with_positions(
+                    let open_options = workspace::OpenOptions::default();
+                    let (workspace, _results) = open_paths_for_location(
                         &paths_with_position,
                         &[],
                         false,
-                        app_state,
-                        workspace::OpenOptions::default(),
+                        &workspace::SerializedWorkspaceLocation::Local,
+                        &app_state,
+                        &open_options,
                         cx,
                     )
                     .await?;
@@ -1096,34 +1097,34 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
         return;
     }
 
-    if let Some(connection_options) = request.remote_connection {
-        cx.spawn(async move |cx| {
-            let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
-            open_remote_project(
-                connection_options,
-                paths,
-                app_state,
-                workspace::OpenOptions::default(),
-                cx,
-            )
-            .await
-        })
-        .detach_and_log_err(cx);
-        return;
-    }
-
     let mut task = None;
-    if !request.open_paths.is_empty() || !request.diff_paths.is_empty() {
+    if !request.open_paths.is_empty()
+        || !request.diff_paths.is_empty()
+        || request.remote_connection.is_some()
+    {
         let app_state = app_state.clone();
+        let location = match &request.remote_connection {
+            Some(connection) => workspace::SerializedWorkspaceLocation::Remote(connection.clone()),
+            None => workspace::SerializedWorkspaceLocation::Local,
+        };
         task = Some(cx.spawn(async move |cx| {
-            let paths_with_position =
-                derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
-            let (_window, results) = open_paths_with_positions(
+            let paths_with_position = match location {
+                // workspace::SerializedWorkspaceLocation::Remote(_) => {
+                //     recent_projects::determine_paths_with_positions(connection, request.open_paths.into_iter().map(|path| PathBuf::new(path)).collect()).await
+                // }
+                // workspace::SerializedWorkspaceLocation::Local => {
+                _ => derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await,
+            };
+
+            let open_options = workspace::OpenOptions::default();
+
+            let (_window, results) = open_paths_for_location(
                 &paths_with_position,
                 &request.diff_paths,
                 request.diff_all,
-                app_state,
-                workspace::OpenOptions::default(),
+                &location,
+                &app_state,
+                &open_options,
                 cx,
             )
             .await?;
@@ -1315,6 +1316,7 @@ async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp
                             cx,
                         )
                         .await
+                        .map(|_| ())
                         .map_err(|e| anyhow::anyhow!(e))
                     });
                     tasks.push(task);

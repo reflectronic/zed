@@ -1912,6 +1912,7 @@ pub fn open_new_ssh_project_from_project(
             cx,
         )
         .await
+        .map(|_| ())
     })
 }
 

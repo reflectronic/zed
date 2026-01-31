@@ -5,12 +5,10 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use askpass::EncryptedPassword;
-use editor::Editor;
 use extension_host::ExtensionStore;
 use futures::{FutureExt as _, channel::oneshot, select};
 use gpui::{AppContext, AsyncApp, PromptLevel};
 
-use language::Point;
 use project::trusted_worktrees;
 use remote::{
     DockerConnectionOptions, Interactive, RemoteConnection, RemoteConnectionOptions,
@@ -19,9 +17,7 @@ use remote::{
 pub use settings::SshConnection;
 use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
 use util::paths::PathWithPosition;
-use workspace::{
-    AppState, OpenOptions, SerializedWorkspaceLocation, Workspace, find_existing_workspace,
-};
+use workspace::{AppState, OpenedWorkspace, Workspace};
 
 pub use remote_connection::{
     RemoteClientDelegate, RemoteConnectionModal, RemoteConnectionPrompt, SshConnectionHeader,
@@ -131,45 +127,8 @@ pub async fn open_remote_project(
     app_state: Arc<AppState>,
     open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
-) -> Result<()> {
+) -> Result<OpenedWorkspace> {
     let created_new_window = open_options.replace_window.is_none();
-
-    let (existing, open_visible) = find_existing_workspace(
-        &paths,
-        &app_state,
-        &open_options,
-        &SerializedWorkspaceLocation::Remote(connection_options.clone()),
-        cx,
-    )
-    .await;
-
-    if let Some(existing) = existing {
-        let open_results = existing
-            .update(cx, |workspace, window, cx| {
-                window.activate_window();
-                workspace.open_paths(
-                    paths,
-                    OpenOptions {
-                        visible: Some(open_visible),
-                        ..Default::default()
-                    },
-                    None,
-                    window,
-                    cx,
-                )
-            })?
-            .await;
-
-        _ = existing.update(cx, |workspace, _, cx| {
-            for item in open_results.iter().flatten() {
-                if let Err(e) = item {
-                    workspace.show_error(&e, cx);
-                }
-            }
-        });
-
-        return Ok(());
-    }
 
     let window = if let Some(window) = open_options.replace_window {
         window
@@ -303,12 +262,9 @@ pub async fn open_remote_project(
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
                 }
-                return Ok(());
+                return Err(anyhow::anyhow!("Connection cancelled"));
             }
         };
-
-        let (paths, paths_with_positions) =
-            determine_paths_with_positions(&remote_connection, paths.clone()).await;
 
         let opened_items = cx
             .update(|cx| {
@@ -377,49 +333,36 @@ pub async fn open_remote_project(
             }
 
             Ok(items) => {
-                for (item, path) in items.into_iter().zip(paths_with_positions) {
-                    let Some(item) = item else {
-                        continue;
-                    };
-                    let Some(row) = path.row else {
-                        continue;
-                    };
-                    if let Some(active_editor) = item.downcast::<Editor>() {
-                        window
-                            .update(cx, |_, window, cx| {
-                                active_editor.update(cx, |editor, cx| {
-                                    let row = row.saturating_sub(1);
-                                    let col = path.column.unwrap_or(0).saturating_sub(1);
-                                    editor.go_to_singleton_buffer_point(
-                                        Point::new(row, col),
-                                        window,
-                                        cx,
-                                    );
+                window
+                    .update(cx, |workspace, _, cx| {
+                        if let Some(client) = workspace.project().read(cx).remote_client() {
+                            if let Some(extension_store) = ExtensionStore::try_global(cx) {
+                                extension_store.update(cx, |store, cx| {
+                                    store.register_remote_client(client, cx)
                                 });
-                            })
-                            .ok();
-                    }
-                }
+                            }
+                        }
+                    })
+                    .ok();
+
+                let items_with_results: Vec<
+                    Option<anyhow::Result<Box<dyn workspace::item::ItemHandle>>>,
+                > = items.into_iter().map(|item| item.map(Ok)).collect();
+                return Ok((window, items_with_results));
             }
         }
-
-        break;
     }
 
-    window
-        .update(cx, |workspace, _, cx| {
-            if let Some(client) = workspace.project().read(cx).remote_client() {
-                if let Some(extension_store) = ExtensionStore::try_global(cx) {
-                    extension_store
-                        .update(cx, |store, cx| store.register_remote_client(client, cx));
-                }
-            }
-        })
-        .ok();
-    Ok(())
+    // If we got here, the user cancelled
+    if created_new_window {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .ok();
+    }
+    Err(anyhow::anyhow!("Connection cancelled"))
 }
 
-pub(crate) async fn determine_paths_with_positions(
+pub async fn determine_paths_with_positions(
     remote_connection: &Arc<dyn RemoteConnection>,
     mut paths: Vec<PathBuf>,
 ) -> (Vec<PathBuf>, Vec<PathWithPosition>) {

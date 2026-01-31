@@ -261,7 +261,9 @@ impl WslOpenModal {
 
         cx.emit(DismissEvent);
         cx.spawn_in(window, async move |_, cx| {
-            open_remote_project(connection_options, paths, app_state, open_options, cx).await
+            open_remote_project(connection_options, paths, app_state, open_options, cx)
+                .await
+                .map(|_| ())
         })
         .detach();
     }
