@@ -194,7 +194,6 @@ pub fn init(cx: &mut App) {
                     cx,
                 )
                 .await
-                .map(|_| ())
             })
             .detach();
         });

@@ -28,9 +28,10 @@ use std::time::Duration;
 use ui::SharedString;
 use util::ResultExt;
 use util::paths::PathWithPosition;
+use workspace::OpenedItems;
 use workspace::PathList;
 use workspace::item::ItemHandle;
-use workspace::{AppState, OpenOptions, OpenedWorkspace, SerializedWorkspaceLocation, Workspace};
+use workspace::{AppState, OpenOptions, SerializedWorkspaceLocation, Workspace};
 
 #[derive(Default, Debug)]
 pub struct OpenRequest {
@@ -337,7 +338,7 @@ pub async fn open_paths_for_location(
     app_state: &Arc<AppState>,
     open_options: &OpenOptions,
     cx: &mut AsyncApp,
-) -> Result<OpenedWorkspace> {
+) -> Result<OpenedItems> {
     match location {
         SerializedWorkspaceLocation::Local => {
             open_paths_with_positions(
@@ -388,24 +389,18 @@ pub async fn open_paths_for_location(
     }
 }
 
-#[allow(clippy::type_complexity)]
 pub async fn open_paths_with_positions(
     path_positions: &[PathWithPosition],
     diff_paths: &[[String; 2]],
     diff_all: bool,
     location: &SerializedWorkspaceLocation,
     open_options: &OpenOptions,
-    create_workspace_with_paths: impl FnOnce(
+    workspace_factory: impl FnOnce(
         Vec<PathBuf>,
         &mut gpui::App,
-    ) -> gpui::Task<
-        anyhow::Result<(
-            WindowHandle<Workspace>,
-            Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
-        )>,
-    >,
+    ) -> gpui::Task<anyhow::Result<OpenedItems>>,
     cx: &mut AsyncApp,
-) -> Result<OpenedWorkspace> {
+) -> Result<OpenedItems> {
     let mut caret_positions = HashMap::default();
 
     let paths = path_positions
@@ -423,11 +418,14 @@ pub async fn open_paths_with_positions(
         })
         .collect::<Vec<_>>();
 
-    let (workspace, mut items) = workspace::open_paths_with_creator(
+    let OpenedItems {
+        workspace,
+        mut items,
+    } = workspace::open_paths_with_workspace_factory(
         paths.clone(),
         location,
         open_options,
-        create_workspace_with_paths,
+        workspace_factory,
         cx,
     )
     .await?;
@@ -476,7 +474,7 @@ pub async fn open_paths_with_positions(
         }
     }
 
-    Ok((workspace, items))
+    Ok(OpenedItems { workspace, items })
 }
 
 pub async fn handle_cli_connection(
@@ -645,7 +643,7 @@ async fn open_workspaces(
         .await;
 
         match result {
-            Ok((workspace, items)) => {
+            Ok(OpenedItems { workspace, items }) => {
                 // Handle CLI wait/responses for both local and remote
                 let workspace_failed = handle_cli_items(
                     workspace,
@@ -691,6 +689,7 @@ async fn handle_cli_items(
     let mut errored = false;
     let mut item_release_futures = Vec::new();
     let mut subscriptions = Vec::new();
+
     // If --wait flag is used with no paths, or a directory, then wait until
     // the entire workspace is closed.
     if wait {
@@ -1184,7 +1183,6 @@ mod tests {
         let workspace_paths_reuse = vec![file1_path.to_string()];
         let window_to_replace = find_existing_workspace(
             paths,
-            &app_state,
             &workspace::OpenOptions::default(),
             &workspace::SerializedWorkspaceLocation::Local,
             &mut cx.to_async(),

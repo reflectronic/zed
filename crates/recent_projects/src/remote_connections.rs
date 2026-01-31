@@ -17,7 +17,7 @@ use remote::{
 pub use settings::SshConnection;
 use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
 use util::paths::PathWithPosition;
-use workspace::{AppState, OpenedWorkspace, Workspace};
+use workspace::{AppState, OpenedItems, Workspace};
 
 pub use remote_connection::{
     RemoteClientDelegate, RemoteConnectionModal, RemoteConnectionPrompt, SshConnectionHeader,
@@ -127,9 +127,8 @@ pub async fn open_remote_project(
     app_state: Arc<AppState>,
     open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
-) -> Result<OpenedWorkspace> {
+) -> Result<OpenedItems> {
     let created_new_window = open_options.replace_window.is_none();
-
     let window = if let Some(window) = open_options.replace_window {
         window
     } else {
@@ -345,10 +344,11 @@ pub async fn open_remote_project(
                     })
                     .ok();
 
-                let items_with_results: Vec<
-                    Option<anyhow::Result<Box<dyn workspace::item::ItemHandle>>>,
-                > = items.into_iter().map(|item| item.map(Ok)).collect();
-                return Ok((window, items_with_results));
+                let items_with_results = items.into_iter().map(|item| item.map(Ok)).collect();
+                return Ok(OpenedItems {
+                    workspace: window,
+                    items: items_with_results,
+                });
             }
         }
     }

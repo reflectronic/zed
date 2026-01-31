@@ -107,7 +107,7 @@ pub fn new_journal_entry(workspace: &Workspace, window: &mut Window, cx: &mut Ap
         .spawn(cx, async move |cx| {
             let (journal_dir, entry_path) = create_entry.await?;
             let opened = if open_new_workspace {
-                let (new_workspace, _) = cx
+                let new_workspace = cx
                     .update(|_window, cx| {
                         workspace::open_paths(
                             &[journal_dir],
@@ -116,7 +116,8 @@ pub fn new_journal_entry(workspace: &Workspace, window: &mut Window, cx: &mut Ap
                             cx,
                         )
                     })?
-                    .await?;
+                    .await?
+                    .workspace;
                 new_workspace
                     .update(cx, |workspace, window, cx| {
                         workspace.open_paths(

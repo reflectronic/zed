@@ -133,7 +133,6 @@ impl DisconnectedOverlay {
                 cx,
             )
             .await
-            .map(|_| ())
         })
         .detach_and_prompt_err("Failed to reconnect", window, cx, |_, _, _| None);
     }

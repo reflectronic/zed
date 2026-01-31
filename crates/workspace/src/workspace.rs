@@ -44,21 +44,17 @@ use futures::{
 };
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Bounds, Context,
-    CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
-    SystemWindowTabController, Task, Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId,
-    WindowOptions, actions, canvas, point, relative, size, transparent_black,
+    CursorStyle, Decorations, DismissEvent, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView,
+    MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
+    Subscription, SystemWindowTabController, Task, Tiling, WeakEntity, WindowBounds, WindowHandle,
+    WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
     FollowableItem, FollowableItemHandle, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
     ProjectItem, SerializableItem, SerializableItemHandle, WeakItemHandle,
 };
-pub type OpenedWorkspace = (
-    WindowHandle<Workspace>,
-    Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
-);
 use itertools::Itertools;
 use language::{Buffer, LanguageRegistry, Rope, language_settings::all_language_settings};
 pub use modal_layer::*;
@@ -1665,12 +1661,7 @@ impl Workspace {
         env: Option<HashMap<String, String>>,
         init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
         cx: &mut App,
-    ) -> Task<
-        anyhow::Result<(
-            WindowHandle<Workspace>,
-            Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
-        )>,
-    > {
+    ) -> Task<anyhow::Result<OpenedItems>> {
         let project_handle = Project::local(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
@@ -1892,7 +1883,10 @@ impl Workspace {
                     workspace.update_history(cx);
                 })
                 .log_err();
-            Ok((window, opened_items))
+            Ok(OpenedItems {
+                workspace: window,
+                items: opened_items,
+            })
         })
     }
 
@@ -2495,8 +2489,7 @@ impl Workspace {
             let env = self.project.read(cx).cli_environment(cx);
             let task = Self::new_local(Vec::new(), self.app_state.clone(), None, env, None, cx);
             cx.spawn_in(window, async move |_vh, cx| {
-                let (workspace, _) = task.await?;
-                workspace.update(cx, callback)
+                task.await?.workspace.update(cx, callback)
             })
         }
     }
@@ -2522,8 +2515,7 @@ impl Workspace {
             let env = self.project.read(cx).cli_environment(cx);
             let task = Self::new_local(Vec::new(), self.app_state.clone(), None, env, None, cx);
             cx.spawn_in(window, async move |_vh, cx| {
-                let (workspace, _) = task.await?;
-                workspace.update(cx, callback)
+                task.await?.workspace.update(cx, callback)
             })
         }
     }
@@ -8080,7 +8072,7 @@ pub fn join_channel(
         let mut active_window = requesting_window.or_else(|| activate_any_workspace_window(cx));
         if active_window.is_none() {
             // no open workspaces, make one to show the error in (blergh)
-            let (window_handle, _) = cx
+            let window_handle = cx
                 .update(|cx| {
                     Workspace::new_local(
                         vec![],
@@ -8091,7 +8083,8 @@ pub fn join_channel(
                         cx,
                     )
                 })
-                .await?;
+                .await?
+                .workspace;
 
             if result.is_ok() {
                 cx.update(|cx| {
@@ -8190,13 +8183,10 @@ pub fn workspace_windows_for_location(
         .filter_map(|window| window.downcast::<Workspace>())
         .filter(|workspace| {
             workspace.read(cx).is_ok_and(|workspace| {
-                if let WorkspaceLocation::Location(location, _) = workspace.workspace_location(cx)
-                    && &location == serialized_location
-                {
-                    true
-                } else {
-                    false
-                }
+                matches!(
+                    workspace.workspace_location(cx),
+                    WorkspaceLocation::Location(location, _) if &location == serialized_location
+                )
             })
         })
         .collect()
@@ -8210,6 +8200,11 @@ pub struct OpenOptions {
     pub wait: bool,
     pub replace_window: Option<WindowHandle<Workspace>>,
     pub env: Option<HashMap<String, String>>,
+}
+
+pub struct OpenedItems {
+    pub workspace: WindowHandle<Workspace>,
+    pub items: Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
 }
 
 /// Opens a workspace by its database ID, used for restoring empty workspaces with unsaved content.
@@ -8348,22 +8343,6 @@ pub async fn find_existing_workspace(
             && all_paths_are_files
         {
             cx.update(|cx| {
-                // Only fall back to active local window when opening local paths.
-                // For remote paths, we should not reuse a local workspace.
-                if matches!(location, SerializedWorkspaceLocation::Local) {
-                    if let Some(window) = cx
-                        .active_window()
-                        .and_then(|window| window.downcast::<Workspace>())
-                        && let Ok(workspace) = window.read(cx)
-                    {
-                        let project = workspace.project().read(cx);
-                        if project.is_local() && !project.is_via_collab() {
-                            existing = Some(window);
-                            open_visible = OpenVisible::None;
-                            return;
-                        }
-                    }
-                }
                 for window in workspace_windows_for_location(location, cx) {
                     existing = Some(window);
                     open_visible = OpenVisible::None;
@@ -8375,64 +8354,14 @@ pub async fn find_existing_workspace(
     return (existing, open_visible);
 }
 
-#[allow(clippy::type_complexity)]
-pub async fn open_paths_with_creator(
-    abs_paths: Vec<PathBuf>,
-    location: &SerializedWorkspaceLocation,
-    open_options: &OpenOptions,
-    create_workspace_with_paths: impl FnOnce(
-        Vec<PathBuf>,
-        &mut App,
-    ) -> Task<
-        anyhow::Result<(
-            WindowHandle<Workspace>,
-            Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
-        )>,
-    >,
-    cx: &mut AsyncApp,
-) -> anyhow::Result<OpenedWorkspace> {
-    let (existing, open_visible) =
-        find_existing_workspace(&abs_paths, open_options, location, cx).await;
-
-    if let Some(existing) = existing {
-        let open_task = existing
-            .update(cx, |workspace, window, cx| {
-                window.activate_window();
-                workspace.open_paths(
-                    abs_paths,
-                    OpenOptions {
-                        visible: Some(open_visible),
-                        ..Default::default()
-                    },
-                    None,
-                    window,
-                    cx,
-                )
-            })?
-            .await;
-
-        _ = existing.update(cx, |workspace, _, cx| {
-            for item in open_task.iter().flatten() {
-                if let Err(e) = item {
-                    workspace.show_error(&e, cx);
-                }
-            }
-        });
-
-        Ok((existing, open_task))
-    } else {
-        cx.update(|cx| create_workspace_with_paths(abs_paths, cx))
-            .await
-    }
-}
-
-#[allow(clippy::type_complexity)]
+/// Opens paths in a local workspace, finding an existing workspace if possible.
+/// This is a convenience wrapper around `open_paths_with_workspace_factory`.
 pub fn open_paths(
     abs_paths: &[PathBuf],
     app_state: Arc<AppState>,
     open_options: OpenOptions,
     cx: &mut App,
-) -> Task<anyhow::Result<OpenedWorkspace>> {
+) -> Task<anyhow::Result<OpenedItems>> {
     let abs_paths = abs_paths.to_vec();
     #[cfg(target_os = "windows")]
     let wsl_path = abs_paths
@@ -8440,9 +8369,10 @@ pub fn open_paths(
         .find_map(|p| util::paths::WslPath::from_path(p));
 
     cx.spawn(async move |cx| {
-        let result = open_paths_with_creator(
+        let result = open_paths_with_workspace_factory(
             abs_paths,
-            &SerializedWorkspaceLocation::Local,            &open_options,
+            &SerializedWorkspaceLocation::Local,
+            &open_options,
             |paths, cx| {
                 Workspace::new_local(
                     paths,
@@ -8458,35 +8388,86 @@ pub fn open_paths(
         .await;
 
         #[cfg(target_os = "windows")]
-        if let Some(util::paths::WslPath{distro, path}) = wsl_path
-            && let Ok((workspace, _)) = &result
+        if let Some(util::paths::WslPath { distro, path }) = wsl_path
+            && let Ok(OpenedItems { workspace, .. }) = &result
         {
             workspace
                 .update(cx, move |workspace, _window, cx| {
                     struct OpenInWsl;
-                    workspace.show_notification(NotificationId::unique::<OpenInWsl>(), cx, move |cx| {
-                        let display_path = util::markdown::MarkdownInlineCode(&path.to_string_lossy());
-                        let msg = format!("{display_path} is inside a WSL filesystem, some features may not work unless you open it with WSL remote");
-                        cx.new(move |cx| {
-                            MessageNotification::new(msg, cx)
-                                .primary_message("Open in WSL")
-                                .primary_icon(IconName::FolderOpen)
-                                .primary_on_click(move |window, cx| {
-                                    window.dispatch_action(Box::new(remote::OpenWslPath {
-                                            distro: remote::WslConnectionOptions {
+                    workspace.show_notification(
+                        NotificationId::unique::<OpenInWsl>(),
+                        cx,
+                        move |cx| {
+                            let display_path =
+                                util::markdown::MarkdownInlineCode(&path.to_string_lossy());
+                            let msg = format!("{display_path} is inside a WSL filesystem, some features may not work unless you open it with WSL remote");
+                            cx.new(move |cx| {
+                                MessageNotification::new(msg, cx)
+                                    .primary_message("Open in WSL")
+                                    .primary_icon(IconName::FolderOpen)
+                                    .primary_on_click(move |window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(remote::OpenWslPath {
+                                                distro: remote::WslConnectionOptions {
                                                     distro_name: distro.clone(),
-                                                user: None,
-                                            },
-                                            paths: vec![path.clone().into()],
-                                        }), cx)
-                                })
-                        })
-                    });
+                                                    user: None,
+                                                },
+                                                paths: vec![path.clone().into()],
+                                            }),
+                                            cx,
+                                        );
+                                        cx.emit(DismissEvent);
+                                    })
+                            })
+                        },
+                    );
                 })
-                .unwrap();
-        };
+                .ok();
+        }
+
         result
     })
+}
+
+pub async fn open_paths_with_workspace_factory(
+    abs_paths: Vec<PathBuf>,
+    location: &SerializedWorkspaceLocation,
+    open_options: &OpenOptions,
+    workspace_factory: impl FnOnce(Vec<PathBuf>, &mut App) -> Task<anyhow::Result<OpenedItems>>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<OpenedItems> {
+    let (existing, open_visible) =
+        find_existing_workspace(&abs_paths, open_options, location, cx).await;
+
+    if let Some(workspace) = existing {
+        let items = workspace
+            .update(cx, |workspace, window, cx| {
+                window.activate_window();
+                workspace.open_paths(
+                    abs_paths,
+                    OpenOptions {
+                        visible: Some(open_visible),
+                        ..Default::default()
+                    },
+                    None,
+                    window,
+                    cx,
+                )
+            })?
+            .await;
+
+        _ = workspace.update(cx, |workspace, _, cx| {
+            for item in items.iter().flatten() {
+                if let Err(e) = item {
+                    workspace.show_error(&e, cx);
+                }
+            }
+        });
+
+        Ok(OpenedItems { workspace, items })
+    } else {
+        cx.update(|cx| workspace_factory(abs_paths, cx)).await
+    }
 }
 
 pub fn open_new(
@@ -8504,7 +8485,7 @@ pub fn open_new(
         cx,
     );
     cx.spawn(async move |_cx| {
-        let (_workspace, _opened_paths) = task.await?;
+        let _ = task.await?;
         // Init callback is called synchronously during workspace creation
         Ok(())
     })

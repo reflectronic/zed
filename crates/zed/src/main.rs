@@ -1056,7 +1056,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     let paths_with_position =
                         derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
                     let open_options = workspace::OpenOptions::default();
-                    let (workspace, _results) = open_paths_for_location(
+                    let workspace = open_paths_for_location(
                         &paths_with_position,
                         &[],
                         false,
@@ -1065,7 +1065,8 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                         &open_options,
                         cx,
                     )
-                    .await?;
+                    .await?
+                    .workspace;
 
                     workspace
                         .update(cx, |workspace, window, cx| {
@@ -1118,7 +1119,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
 
             let open_options = workspace::OpenOptions::default();
 
-            let (_window, results) = open_paths_for_location(
+            let results = open_paths_for_location(
                 &paths_with_position,
                 &request.diff_paths,
                 request.diff_all,
@@ -1127,7 +1128,8 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 &open_options,
                 cx,
             )
-            .await?;
+            .await?
+            .items;
             for result in results.into_iter().flatten() {
                 if let Err(err) = result {
                     log::error!("Error opening path: {err}",);

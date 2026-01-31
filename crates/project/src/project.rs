@@ -2323,6 +2323,7 @@ impl Project {
         exclude_sub_dirs: bool,
         cx: &App,
     ) -> Option<bool> {
+        let path = SanitizedPath::new(path).as_path();
         let path_style = self.path_style(cx);
         self.worktrees(cx)
             .filter_map(|worktree| {

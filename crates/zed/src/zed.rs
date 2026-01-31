@@ -2349,10 +2349,9 @@ mod tests {
         rel_path::{RelPath, rel_path},
     };
     use workspace::{
-        NewFile, OpenOptions, OpenVisible, SERIALIZATION_THROTTLE_TIME, SaveIntent, SplitDirection,
-        WorkspaceHandle,
-        item::SaveOptions,
-        item::{Item, ItemHandle},
+        NewFile, OpenOptions, OpenVisible, OpenedItems, SERIALIZATION_THROTTLE_TIME, SaveIntent,
+        SplitDirection, WorkspaceHandle,
+        item::{Item, ItemHandle, SaveOptions},
         open_new, open_paths, pane,
     };
 
@@ -3413,7 +3412,10 @@ mod tests {
             PathBuf::from(path!("/root/.git/HEAD")),
             PathBuf::from(path!("/root/excluded_dir/ignored_subdir")),
         ];
-        let (opened_workspace, new_items) = cx
+        let OpenedItems {
+            workspace: opened_workspace,
+            items: new_items,
+        } = cx
             .update(|cx| {
                 workspace::open_paths(
                     &paths_to_open,
