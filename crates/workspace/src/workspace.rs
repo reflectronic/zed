@@ -8200,10 +8200,20 @@ pub fn workspace_windows_for_location(
         .filter_map(|window| window.downcast::<Workspace>())
         .filter(|workspace| {
             workspace.read(cx).is_ok_and(|workspace| {
-                matches!(
-                    workspace.workspace_location(cx),
-                    WorkspaceLocation::Location(location, _) if &location == serialized_location
-                )
+                let WorkspaceLocation::Location(location, _) = workspace.workspace_location(cx)
+                else {
+                    return false;
+                };
+
+                // For WSL connections, ignore the username when matching. The username is not consistently populated
+                // in the serialized workspace location.
+                match (&location, serialized_location) {
+                    (
+                        SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Wsl(a)),
+                        SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Wsl(b)),
+                    ) => a.distro_name == b.distro_name,
+                    _ => &location == serialized_location,
+                }
             })
         })
         .collect()
@@ -8474,7 +8484,7 @@ fn resolve_paths_with_project(
     raw_paths
         .iter()
         .map(|p| {
-            let parsed = PathWithPosition::parse_str(&p.to_string_lossy();
+            let parsed = PathWithPosition::parse_str(&p.to_string_lossy());
             if parsed.row.is_some() && parsed.path != *p {
                 for worktree in project.worktrees(cx) {
                     let worktree = worktree.read(cx);
