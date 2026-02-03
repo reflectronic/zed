@@ -8404,14 +8404,49 @@ pub fn open_paths(
             &SerializedWorkspaceLocation::Local,
             &open_options,
             |paths, cx| {
-                Workspace::new_local(
-                    paths,
-                    app_state.clone(),
-                    open_options.replace_window,
-                    open_options.env.clone(),
-                    None,
-                    cx,
-                )
+                let app_state = app_state.clone();
+                let open_options = open_options.clone();
+                cx.spawn(async move |cx| {
+                    // Check if all paths are files (not directories).
+                    // If so, and open_new_workspace isn't explicitly requested,
+                    // return None to signal we should reuse an existing workspace.
+                    if open_options.open_new_workspace.is_none() {
+                        let mut all_files = true;
+                        for path in &paths {
+                            if let Ok(Some(metadata)) = app_state.fs.metadata(path).await {
+                                if metadata.is_dir {
+                                    all_files = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_files {
+                            let has_existing_workspace = cx.update(|cx| {
+                                !workspace_windows_for_location(
+                                    &SerializedWorkspaceLocation::Local,
+                                    cx,
+                                )
+                                .is_empty()
+                            });
+                            if has_existing_workspace {
+                                return Ok(None);
+                            }
+                        }
+                    }
+
+                    cx.update(|cx| {
+                        Workspace::new_local(
+                            paths,
+                            app_state.clone(),
+                            open_options.replace_window,
+                            open_options.env.clone(),
+                            None,
+                            cx,
+                        )
+                    })
+                    .await
+                    .map(Some)
+                })
             },
             cx,
         )
@@ -8505,7 +8540,7 @@ pub async fn open_paths_with_workspace_factory(
     abs_paths: Vec<PathBuf>,
     location: &SerializedWorkspaceLocation,
     open_options: &OpenOptions,
-    workspace_factory: impl FnOnce(Vec<PathBuf>, &mut App) -> Task<anyhow::Result<OpenedItems>>,
+    workspace_factory: impl FnOnce(Vec<PathBuf>, &mut App) -> Task<anyhow::Result<Option<OpenedItems>>>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<OpenedItems> {
     #[cfg(target_os = "windows")]
@@ -8518,42 +8553,32 @@ pub async fn open_paths_with_workspace_factory(
         find_existing_workspace(&expanded_paths, open_options, location, cx).await;
 
     let result = if let Some(workspace) = existing {
-        let resolved_paths = workspace.read_with(cx, |workspace, cx| {
-            resolve_paths_with_project(&abs_paths, workspace.project.read(cx), cx)
-        })?;
-
-        let paths_for_open: Vec<PathBuf> = resolved_paths.iter().map(|p| p.path.clone()).collect();
-        let items = workspace
-            .update(cx, |workspace, window, cx| {
-                window.activate_window();
-                workspace.open_paths(
-                    paths_for_open,
-                    OpenOptions {
-                        visible: Some(open_visible),
-                        ..Default::default()
-                    },
-                    None,
-                    window,
-                    cx,
-                )
-            })?
-            .await;
-
-        _ = workspace.update(cx, |workspace, _, cx| {
-            for item in items.iter().flatten() {
-                if let Err(e) = item {
-                    workspace.show_error(&e, cx);
+        open_paths_in_existing_workspace(workspace, &abs_paths, open_visible, cx).await
+    } else {
+        // No existing workspace contains these paths. Ask the factory to create one.
+        // The factory may return None if paths are all files and it prefers to reuse
+        // any existing workspace rather than creating a new one.
+        match cx
+            .update(|cx| workspace_factory(abs_paths.clone(), cx))
+            .await?
+        {
+            Some(opened) => Ok(opened),
+            None => {
+                // Factory declined to create a new workspace - pick any existing one
+                let workspace = cx.update(|cx| {
+                    workspace_windows_for_location(location, cx)
+                        .into_iter()
+                        .next()
+                });
+                if let Some(workspace) = workspace {
+                    open_paths_in_existing_workspace(workspace, &abs_paths, OpenVisible::None, cx)
+                        .await
+                } else {
+                    // No existing workspace available, factory must create one
+                    anyhow::bail!("No existing workspace to add files to")
                 }
             }
-        });
-
-        Ok(OpenedItems {
-            workspace,
-            items,
-            resolved_paths,
-        })
-    } else {
-        cx.update(|cx| workspace_factory(abs_paths, cx)).await
+        }
     };
 
     #[cfg(target_os = "windows")]
@@ -8586,6 +8611,48 @@ pub async fn open_paths_with_workspace_factory(
     };
 
     result
+}
+
+async fn open_paths_in_existing_workspace(
+    workspace: WindowHandle<Workspace>,
+    abs_paths: &[PathBuf],
+    open_visible: OpenVisible,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<OpenedItems> {
+    let resolved_paths = workspace.read_with(cx, |workspace, cx| {
+        resolve_paths_with_project(abs_paths, workspace.project.read(cx), cx)
+    })?;
+
+    let paths_for_open: Vec<PathBuf> = resolved_paths.iter().map(|p| p.path.clone()).collect();
+    let items = workspace
+        .update(cx, |workspace, window, cx| {
+            window.activate_window();
+            workspace.open_paths(
+                paths_for_open,
+                OpenOptions {
+                    visible: Some(open_visible),
+                    ..Default::default()
+                },
+                None,
+                window,
+                cx,
+            )
+        })?
+        .await;
+
+    _ = workspace.update(cx, |workspace, _, cx| {
+        for item in items.iter().flatten() {
+            if let Err(e) = item {
+                workspace.show_error(&e, cx);
+            }
+        }
+    });
+
+    Ok(OpenedItems {
+        workspace,
+        items,
+        resolved_paths,
+    })
 }
 
 pub fn open_new(

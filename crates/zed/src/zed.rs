@@ -3415,6 +3415,7 @@ mod tests {
         let OpenedItems {
             workspace: opened_workspace,
             items: new_items,
+            ..
         } = cx
             .update(|cx| {
                 workspace::open_paths(

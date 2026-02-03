@@ -348,14 +348,15 @@ pub async fn open_paths_for_location(
                 location,
                 open_options,
                 |paths, cx| {
-                    Workspace::new_local(
+                    let task = Workspace::new_local(
                         paths,
                         app_state.clone(),
                         open_options.replace_window.clone(),
                         open_options.env.clone(),
                         None,
                         cx,
-                    )
+                    );
+                    cx.spawn(async move |_| task.await.map(Some))
                 },
                 cx,
             )
@@ -379,9 +380,7 @@ pub async fn open_paths_for_location(
                     let app_state = app_state.clone();
                     let open_options = open_options.clone();
                     cx.spawn(async move |cx| {
-                        open_remote_project(connection, paths, app_state, open_options, cx)
-                            .await?
-                            .ok_or_else(|| anyhow::anyhow!("Connection cancelled"))
+                        open_remote_project(connection, paths, app_state, open_options, cx).await
                     })
                 },
                 cx,
@@ -400,7 +399,7 @@ pub async fn open_paths_with_positions(
     workspace_factory: impl FnOnce(
         Vec<PathBuf>,
         &mut gpui::App,
-    ) -> gpui::Task<anyhow::Result<OpenedItems>>,
+    ) -> gpui::Task<anyhow::Result<Option<OpenedItems>>>,
     cx: &mut AsyncApp,
 ) -> Result<OpenedItems> {
     let OpenedItems {
@@ -978,27 +977,26 @@ mod tests {
             )
             .await;
 
-        let (response_tx, _) = ipc::channel::<CliResponse>().unwrap();
-        let workspace_paths = vec![path!("/root/dir1").to_owned()];
+        let workspace_paths = vec![PathBuf::from(path!("/root/dir1"))];
 
         let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
         cx.spawn({
             let app_state = app_state.clone();
             move |mut cx| async move {
-                let errored = open_local_workspace(
+                let result = open_paths_for_location(
                     workspace_paths,
-                    vec![],
+                    &[],
                     false,
-                    workspace::OpenOptions {
+                    &workspace::SerializedWorkspaceLocation::Local,
+                    &app_state,
+                    &workspace::OpenOptions {
                         wait: true,
                         ..Default::default()
                     },
-                    &response_tx,
-                    &app_state,
                     &mut cx,
                 )
                 .await;
-                let _ = done_tx.send(errored);
+                let _ = done_tx.send(result.is_err());
             }
         })
         .detach();
@@ -1071,29 +1069,27 @@ mod tests {
         app_state: Arc<AppState>,
         cx: &TestAppContext,
     ) {
-        let (response_tx, _) = ipc::channel::<CliResponse>().unwrap();
+        let workspace_paths = vec![PathBuf::from(path)];
 
-        let workspace_paths = vec![path.to_owned()];
-
-        let errored = cx
+        let result = cx
             .spawn(|mut cx| async move {
-                open_local_workspace(
+                open_paths_for_location(
                     workspace_paths,
-                    vec![],
+                    &[],
                     false,
-                    OpenOptions {
+                    &workspace::SerializedWorkspaceLocation::Local,
+                    &app_state,
+                    &OpenOptions {
                         open_new_workspace,
                         ..Default::default()
                     },
-                    &response_tx,
-                    &app_state,
                     &mut cx,
                 )
                 .await
             })
             .await;
 
-        assert!(!errored);
+        assert!(result.is_ok());
     }
 
     #[gpui::test]
@@ -1143,21 +1139,19 @@ mod tests {
             .unwrap();
 
         // First, open a workspace normally
-        let (response_tx, _response_rx) = ipc::channel::<CliResponse>().unwrap();
-        let workspace_paths = vec![file1_path.to_string()];
+        let workspace_paths = vec![PathBuf::from(file1_path)];
 
-        let _errored = cx
+        let _result = cx
             .spawn({
                 let app_state = app_state.clone();
-                let response_tx = response_tx.clone();
                 |mut cx| async move {
-                    open_local_workspace(
+                    open_paths_for_location(
                         workspace_paths,
-                        vec![],
+                        &[],
                         false,
-                        workspace::OpenOptions::default(),
-                        &response_tx,
+                        &workspace::SerializedWorkspaceLocation::Local,
                         &app_state,
+                        &workspace::OpenOptions::default(),
                         &mut cx,
                     )
                     .await
@@ -1166,9 +1160,9 @@ mod tests {
             .await;
 
         // Now test the reuse functionality - should replace the existing workspace
-        let workspace_paths_reuse = vec![file1_path.to_string()];
+        let workspace_paths_reuse = vec![PathBuf::from(file1_path)];
         let window_to_replace = find_existing_workspace(
-            paths,
+            &workspace_paths_reuse,
             &workspace::OpenOptions::default(),
             &workspace::SerializedWorkspaceLocation::Local,
             &mut cx.to_async(),
@@ -1177,21 +1171,20 @@ mod tests {
         .0
         .unwrap();
 
-        let errored_reuse = cx
+        let result_reuse = cx
             .spawn({
                 let app_state = app_state.clone();
-                let response_tx = response_tx.clone();
                 |mut cx| async move {
-                    open_local_workspace(
+                    open_paths_for_location(
                         workspace_paths_reuse,
-                        vec![],
+                        &[],
                         false,
-                        workspace::OpenOptions {
+                        &workspace::SerializedWorkspaceLocation::Local,
+                        &app_state,
+                        &workspace::OpenOptions {
                             replace_window: Some(window_to_replace),
                             ..Default::default()
                         },
-                        &response_tx,
-                        &app_state,
                         &mut cx,
                     )
                     .await
@@ -1199,7 +1192,7 @@ mod tests {
             })
             .await;
 
-        assert!(!errored_reuse);
+        assert!(result_reuse.is_ok());
     }
 
     #[gpui::test]

@@ -2334,7 +2334,12 @@ impl Project {
                     .as_ref()
                     .and_then(|p| worktree.entry_for_path(p))
                     .is_some_and(|e| e.is_dir());
-                let contains = relative_path.is_some() && (!exclude_sub_dirs || !is_dir);
+                // Don't exclude the worktree root itself, only actual subdirectories
+                let is_subdir = relative_path
+                    .as_ref()
+                    .is_some_and(|p| !p.as_ref().as_unix_str().is_empty());
+                let contains =
+                    relative_path.is_some() && (!exclude_sub_dirs || !is_dir || !is_subdir);
                 contains.then(|| worktree.is_visible())
             })
             .max()
