@@ -123,7 +123,7 @@ pub use ui;
 use ui::{Window, prelude::*};
 use util::{
     ResultExt, TryFutureExt,
-    paths::{PathStyle, SanitizedPath},
+    paths::{PathStyle, PathWithPosition, SanitizedPath},
     rel_path::RelPath,
     serde::default_true,
 };
@@ -1674,12 +1674,28 @@ impl Workspace {
         );
 
         cx.spawn(async move |cx| {
-            let mut paths_to_open = Vec::with_capacity(abs_paths.len());
-            for path in abs_paths.into_iter() {
-                if let Some(canonical) = app_state.fs.canonicalize(&path).await.ok() {
+            let mut resolved_paths = Vec::with_capacity(abs_paths.len());
+            for path in &abs_paths {
+                let parsed = PathWithPosition::parse_str(&path.to_string_lossy());
+
+                let resolved = if parsed.row.is_some() && parsed.path != *path {
+                    if app_state.fs.is_file(path).await {
+                        PathWithPosition::from_path(path.clone())
+                    } else {
+                        parsed
+                    }
+                } else {
+                    parsed
+                };
+                resolved_paths.push(resolved);
+            }
+
+            let mut paths_to_open = Vec::with_capacity(resolved_paths.len());
+            for resolved in &resolved_paths {
+                if let Some(canonical) = app_state.fs.canonicalize(&resolved.path).await.ok() {
                     paths_to_open.push(canonical)
                 } else {
-                    paths_to_open.push(path)
+                    paths_to_open.push(resolved.path.clone())
                 }
             }
 
@@ -1886,6 +1902,7 @@ impl Workspace {
             Ok(OpenedItems {
                 workspace: window,
                 items: opened_items,
+                resolved_paths,
             })
         })
     }
@@ -8205,6 +8222,7 @@ pub struct OpenOptions {
 pub struct OpenedItems {
     pub workspace: WindowHandle<Workspace>,
     pub items: Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
+    pub resolved_paths: Vec<PathWithPosition>,
 }
 
 /// Opens a workspace by its database ID, used for restoring empty workspaces with unsaved content.
@@ -8343,10 +8361,12 @@ pub async fn find_existing_workspace(
             && all_paths_are_files
         {
             cx.update(|cx| {
-                for window in workspace_windows_for_location(location, cx) {
+                if let Some(window) = workspace_windows_for_location(location, cx)
+                    .into_iter()
+                    .next()
+                {
                     existing = Some(window);
                     open_visible = OpenVisible::None;
-                    break;
                 }
             });
         }
@@ -8377,7 +8397,7 @@ pub fn open_paths(
                 Workspace::new_local(
                     paths,
                     app_state.clone(),
-                    open_options.replace_window.clone(),
+                    open_options.replace_window,
                     open_options.env.clone(),
                     None,
                     cx,
@@ -8429,6 +8449,48 @@ pub fn open_paths(
     })
 }
 
+fn expand_ambiguous_paths(raw_paths: &[PathBuf]) -> Vec<PathBuf> {
+    raw_paths
+        .iter()
+        .flat_map(|p| {
+            let parsed = PathWithPosition::parse_str(&p.to_string_lossy());
+            if parsed.row.is_some() && parsed.path != *p {
+                // Ambiguous: could be literal "File.cs:5" or "File.cs" at line 5.
+                // When searching for existing workspaces that contain files, we'll check for both.
+                vec![p.clone(), parsed.path]
+            } else {
+                vec![p.clone()]
+            }
+        })
+        .collect()
+}
+
+fn resolve_paths_with_project(
+    raw_paths: &[PathBuf],
+    project: &Project,
+    cx: &App,
+) -> Vec<PathWithPosition> {
+    let path_style = project.path_style(cx);
+    raw_paths
+        .iter()
+        .map(|p| {
+            let parsed = PathWithPosition::parse_str(&p.to_string_lossy();
+            if parsed.row.is_some() && parsed.path != *p {
+                for worktree in project.worktrees(cx) {
+                    let worktree = worktree.read(cx);
+                    let abs_path = worktree.abs_path();
+                    if let Some(rel) = path_style.strip_prefix(p, abs_path.as_ref()) {
+                        if worktree.entry_for_path(&rel).is_some_and(|e| e.is_file()) {
+                            return PathWithPosition::from_path(p.clone());
+                        }
+                    }
+                }
+            }
+            parsed
+        })
+        .collect()
+}
+
 pub async fn open_paths_with_workspace_factory(
     abs_paths: Vec<PathBuf>,
     location: &SerializedWorkspaceLocation,
@@ -8441,15 +8503,21 @@ pub async fn open_paths_with_workspace_factory(
         .iter()
         .find_map(|p| util::paths::WslPath::from_path(p));
 
+    let expanded_paths = expand_ambiguous_paths(&abs_paths);
     let (existing, open_visible) =
-        find_existing_workspace(&abs_paths, open_options, location, cx).await;
+        find_existing_workspace(&expanded_paths, open_options, location, cx).await;
 
     let result = if let Some(workspace) = existing {
+        let resolved_paths = workspace.read_with(cx, |workspace, cx| {
+            resolve_paths_with_project(&abs_paths, workspace.project.read(cx), cx)
+        })?;
+
+        let paths_for_open: Vec<PathBuf> = resolved_paths.iter().map(|p| p.path.clone()).collect();
         let items = workspace
             .update(cx, |workspace, window, cx| {
                 window.activate_window();
                 workspace.open_paths(
-                    abs_paths,
+                    paths_for_open,
                     OpenOptions {
                         visible: Some(open_visible),
                         ..Default::default()
@@ -8469,7 +8537,11 @@ pub async fn open_paths_with_workspace_factory(
             }
         });
 
-        Ok(OpenedItems { workspace, items })
+        Ok(OpenedItems {
+            workspace,
+            items,
+            resolved_paths,
+        })
     } else {
         cx.update(|cx| workspace_factory(abs_paths, cx)).await
     };

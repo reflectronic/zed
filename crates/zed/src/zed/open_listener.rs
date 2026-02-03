@@ -7,11 +7,11 @@ use client::{ZedLink, parse_zed_link};
 use collections::HashMap;
 use db::kvp::KEY_VALUE_STORE;
 use editor::Editor;
-use fs::Fs;
+
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::{mpsc, oneshot};
 use futures::future;
-use futures::future::join_all;
+
 use futures::{FutureExt, SinkExt, StreamExt};
 use git_ui::{file_diff_view::FileDiffView, multi_diff_view::MultiDiffView};
 use gpui::{App, AsyncApp, Global, WindowHandle};
@@ -331,7 +331,7 @@ fn connect_to_cli(
 }
 
 pub async fn open_paths_for_location(
-    paths_with_position: &[PathWithPosition],
+    paths: Vec<PathBuf>,
     diff_paths: &[[String; 2]],
     diff_all: bool,
     location: &SerializedWorkspaceLocation,
@@ -342,7 +342,7 @@ pub async fn open_paths_for_location(
     match location {
         SerializedWorkspaceLocation::Local => {
             open_paths_with_positions(
-                paths_with_position,
+                paths,
                 diff_paths,
                 diff_all,
                 location,
@@ -369,7 +369,7 @@ pub async fn open_paths_for_location(
                 });
             }
             open_paths_with_positions(
-                paths_with_position,
+                paths,
                 diff_paths,
                 diff_all,
                 location,
@@ -390,7 +390,7 @@ pub async fn open_paths_for_location(
 }
 
 pub async fn open_paths_with_positions(
-    path_positions: &[PathWithPosition],
+    paths: Vec<PathBuf>,
     diff_paths: &[[String; 2]],
     diff_all: bool,
     location: &SerializedWorkspaceLocation,
@@ -401,34 +401,29 @@ pub async fn open_paths_with_positions(
     ) -> gpui::Task<anyhow::Result<OpenedItems>>,
     cx: &mut AsyncApp,
 ) -> Result<OpenedItems> {
-    let mut caret_positions = HashMap::default();
-
-    let paths = path_positions
-        .iter()
-        .map(|path_with_position| {
-            let path = path_with_position.path.clone();
-            if let Some(row) = path_with_position.row
-                && path.is_file()
-            {
-                let row = row.saturating_sub(1);
-                let col = path_with_position.column.unwrap_or(0).saturating_sub(1);
-                caret_positions.insert(path.clone(), Point::new(row, col));
-            }
-            path
-        })
-        .collect::<Vec<_>>();
-
     let OpenedItems {
         workspace,
         mut items,
+        resolved_paths,
     } = workspace::open_paths_with_workspace_factory(
-        paths.clone(),
+        paths,
         location,
         open_options,
         workspace_factory,
         cx,
     )
     .await?;
+
+    let mut caret_positions = HashMap::default();
+    for resolved in &resolved_paths {
+        if let Some(row) = resolved.row {
+            let row = row.saturating_sub(1);
+            let col = resolved.column.unwrap_or(0).saturating_sub(1);
+            caret_positions.insert(resolved.path.clone(), Point::new(row, col));
+        }
+    }
+
+    let paths: Vec<PathBuf> = resolved_paths.iter().map(|p| p.path.clone()).collect();
 
     if diff_all && !diff_paths.is_empty() {
         if let Ok(diff_view) = workspace.update(cx, |workspace, window, cx| {
@@ -474,7 +469,11 @@ pub async fn open_paths_with_positions(
         }
     }
 
-    Ok(OpenedItems { workspace, items })
+    Ok(OpenedItems {
+        workspace,
+        items,
+        resolved_paths,
+    })
 }
 
 pub async fn handle_cli_connection(
@@ -623,16 +622,14 @@ async fn open_workspaces(
             ..Default::default()
         };
 
-        let workspace_paths_strings: Vec<String> = workspace_paths
+        let paths: Vec<PathBuf> = workspace_paths
             .paths()
             .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+            .map(|path| path.to_path_buf())
             .collect();
-        let paths_with_position =
-            derive_paths_with_position(app_state.fs.as_ref(), &workspace_paths_strings).await;
 
         let result = open_paths_for_location(
-            &paths_with_position,
+            paths,
             &diff_paths,
             diff_all,
             &location,
@@ -643,12 +640,16 @@ async fn open_workspaces(
         .await;
 
         match result {
-            Ok(OpenedItems { workspace, items }) => {
+            Ok(OpenedItems {
+                workspace,
+                items,
+                resolved_paths,
+            }) => {
                 // Handle CLI wait/responses for both local and remote
                 let workspace_failed = handle_cli_items(
                     workspace,
                     items,
-                    &paths_with_position,
+                    &resolved_paths,
                     &diff_paths,
                     open_options.wait,
                     responses,
@@ -663,7 +664,7 @@ async fn open_workspaces(
             Err(error) => {
                 responses
                     .send(CliResponse::Stderr {
-                        message: format!("error opening {:?}: {error}", paths_with_position),
+                        message: format!("error opening: {error}"),
                     })
                     .log_err();
                 errored = true;
@@ -765,23 +766,6 @@ async fn handle_cli_items(
     }
 
     errored
-}
-
-pub async fn derive_paths_with_position(
-    _fs: &dyn Fs,
-    path_strings: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Vec<PathWithPosition> {
-    join_all(path_strings.into_iter().map(|path_str| async move {
-        // let canonicalized = fs.canonicalize(Path::new(path_str.as_ref())).await;
-        (path_str, Err::<PathBuf, ()>(()))
-    }))
-    .await
-    .into_iter()
-    .map(|(original, canonicalized)| match canonicalized {
-        Ok(canonicalized) => PathWithPosition::from_path(canonicalized),
-        Err(_) => PathWithPosition::parse_str(original.as_ref()),
-    })
-    .collect()
 }
 
 #[cfg(test)]

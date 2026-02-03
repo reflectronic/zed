@@ -204,6 +204,7 @@ pub async fn open_remote_project(
 
         let Some(delegate) = delegate else { break };
 
+        let paths_for_resolution = paths.clone();
         let connection = remote::connect(connection_options.clone(), delegate.clone(), cx);
         let connection = select! {
             _ = cancel_rx => {
@@ -219,8 +220,15 @@ pub async fn open_remote_project(
             },
             result = connection.fuse() => result,
         };
-        let remote_connection = match connection {
-            Ok(connection) => connection,
+        let (remote_connection, resolved_paths) = match connection {
+            Ok(connection) => {
+                let (_, resolved) = determine_paths_with_positions(
+                    &Arc::new(connection.clone()),
+                    paths_for_resolution,
+                )
+                .await;
+                (connection, resolved)
+            }
             Err(e) => {
                 window
                     .update(cx, |workspace, _, cx| {
@@ -348,6 +356,7 @@ pub async fn open_remote_project(
                 return Ok(OpenedItems {
                     workspace: window,
                     items: items_with_results,
+                    resolved_paths,
                 });
             }
         }

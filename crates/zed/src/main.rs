@@ -60,9 +60,8 @@ use workspace::{
 };
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
-    derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
-    handle_keymap_file_changes, handle_settings_file_changes, initialize_workspace,
-    open_paths_for_location,
+    edit_prediction_registry, handle_cli_connection, handle_keymap_file_changes,
+    handle_settings_file_changes, initialize_workspace, open_paths_for_location,
 };
 
 #[cfg(feature = "mimalloc")]
@@ -1053,11 +1052,11 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             }
             OpenRequestKind::GitCommit { sha } => {
                 cx.spawn(async move |cx| {
-                    let paths_with_position =
-                        derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
+                    let paths: Vec<PathBuf> =
+                        request.open_paths.into_iter().map(PathBuf::from).collect();
                     let open_options = workspace::OpenOptions::default();
                     let workspace = open_paths_for_location(
-                        &paths_with_position,
+                        paths,
                         &[],
                         false,
                         &workspace::SerializedWorkspaceLocation::Local,
@@ -1109,18 +1108,12 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             None => workspace::SerializedWorkspaceLocation::Local,
         };
         task = Some(cx.spawn(async move |cx| {
-            let paths_with_position = match location {
-                // workspace::SerializedWorkspaceLocation::Remote(_) => {
-                //     recent_projects::determine_paths_with_positions(connection, request.open_paths.into_iter().map(|path| PathBuf::new(path)).collect()).await
-                // }
-                // workspace::SerializedWorkspaceLocation::Local => {
-                _ => derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await,
-            };
+            let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
 
             let open_options = workspace::OpenOptions::default();
 
             let results = open_paths_for_location(
-                &paths_with_position,
+                paths,
                 &request.diff_paths,
                 request.diff_all,
                 &location,
