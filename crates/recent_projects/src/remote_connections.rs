@@ -127,7 +127,7 @@ pub async fn open_remote_project(
     app_state: Arc<AppState>,
     open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
-) -> Result<OpenedItems> {
+) -> Result<Option<OpenedItems>> {
     let created_new_window = open_options.replace_window.is_none();
     let window = if let Some(window) = open_options.replace_window {
         window
@@ -269,7 +269,7 @@ pub async fn open_remote_project(
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
                 }
-                return Err(anyhow::anyhow!("Connection cancelled"));
+                return Ok(None);
             }
         };
 
@@ -353,11 +353,11 @@ pub async fn open_remote_project(
                     .ok();
 
                 let items_with_results = items.into_iter().map(|item| item.map(Ok)).collect();
-                return Ok(OpenedItems {
+                return Ok(Some(OpenedItems {
                     workspace: window,
                     items: items_with_results,
                     resolved_paths,
-                });
+                }));
             }
         }
     }
@@ -368,7 +368,7 @@ pub async fn open_remote_project(
             .update(cx, |_, window, _| window.remove_window())
             .ok();
     }
-    Err(anyhow::anyhow!("Connection cancelled"))
+    Ok(None)
 }
 
 pub async fn determine_paths_with_positions(

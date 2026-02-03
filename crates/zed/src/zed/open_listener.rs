@@ -379,7 +379,9 @@ pub async fn open_paths_for_location(
                     let app_state = app_state.clone();
                     let open_options = open_options.clone();
                     cx.spawn(async move |cx| {
-                        open_remote_project(connection, paths, app_state, open_options, cx).await
+                        open_remote_project(connection, paths, app_state, open_options, cx)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("Connection cancelled"))
                     })
                 },
                 cx,
