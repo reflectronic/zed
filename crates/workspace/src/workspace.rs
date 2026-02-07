@@ -8393,13 +8393,8 @@ pub fn open_paths(
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenedItems>> {
     let abs_paths = abs_paths.to_vec();
-    #[cfg(target_os = "windows")]
-    let wsl_path = abs_paths
-        .iter()
-        .find_map(|p| util::paths::WslPath::from_path(p));
-
     cx.spawn(async move |cx| {
-        let result = open_paths_with_workspace_factory(
+        open_paths_with_workspace_factory(
             abs_paths,
             &SerializedWorkspaceLocation::Local,
             &open_options,
@@ -8450,47 +8445,7 @@ pub fn open_paths(
             },
             cx,
         )
-        .await;
-
-        #[cfg(target_os = "windows")]
-        if let Some(util::paths::WslPath { distro, path }) = wsl_path
-            && let Ok(OpenedItems { workspace, .. }) = &result
-        {
-            workspace
-                .update(cx, move |workspace, _window, cx| {
-                    struct OpenInWsl;
-                    workspace.show_notification(
-                        NotificationId::unique::<OpenInWsl>(),
-                        cx,
-                        move |cx| {
-                            let display_path =
-                                util::markdown::MarkdownInlineCode(&path.to_string_lossy());
-                            let msg = format!("{display_path} is inside a WSL filesystem, some features may not work unless you open it with WSL remote");
-                            cx.new(move |cx| {
-                                MessageNotification::new(msg, cx)
-                                    .primary_message("Open in WSL")
-                                    .primary_icon(IconName::FolderOpen)
-                                    .primary_on_click(move |window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(remote::OpenWslPath {
-                                                distro: remote::WslConnectionOptions {
-                                                    distro_name: distro.clone(),
-                                                    user: None,
-                                                },
-                                                paths: vec![path.clone().into()],
-                                            }),
-                                            cx,
-                                        );
-                                        cx.emit(DismissEvent);
-                                    })
-                            })
-                        },
-                    );
-                })
-                .ok();
-        }
-
-        result
+        .await
     })
 }
 
