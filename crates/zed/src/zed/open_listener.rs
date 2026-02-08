@@ -826,10 +826,6 @@ async fn handle_cli_items(
 mod tests {
     use super::*;
     use crate::zed::tests::init_test;
-    use cli::{
-        CliResponse,
-        ipc::{self},
-    };
     use editor::Editor;
     use futures::poll;
     use gpui::{AppContext as _, TestAppContext};
