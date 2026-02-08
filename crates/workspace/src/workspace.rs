@@ -8419,15 +8419,15 @@ pub fn open_paths(
     let abs_paths = abs_paths.to_vec();
     cx.spawn(async move |cx| {
         let fs = app_state.fs.clone();
-        let is_dir = |path: PathBuf| -> BoxFuture<'static, bool> {
+        let is_dir = |path: PathBuf| {
             let fs = fs.clone();
-            Box::pin(async move { fs.is_dir(&path).await })
+            async move { fs.is_dir(&path).await }
         };
         open_paths_with_workspace_factory(
             abs_paths,
             &SerializedWorkspaceLocation::Local,
             &open_options,
-            &is_dir,
+            is_dir,
             |paths, cx| {
                 let app_state = app_state.clone();
                 let open_options = open_options.clone();
@@ -8489,11 +8489,11 @@ fn resolve_paths_with_project(
         .collect()
 }
 
-pub async fn open_paths_with_workspace_factory(
+pub async fn open_paths_with_workspace_factory<IsDirFut: Future<Output = bool> + Send>(
     abs_paths: Vec<PathBuf>,
     location: &SerializedWorkspaceLocation,
     open_options: &OpenOptions,
-    is_dir: &dyn Fn(PathBuf) -> BoxFuture<'static, bool>,
+    is_dir: impl Fn(PathBuf) -> IsDirFut + Send + Sync,
     workspace_factory: impl FnOnce(Vec<PathBuf>, &mut App) -> Task<anyhow::Result<Option<OpenedItems>>>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<OpenedItems> {
@@ -8504,7 +8504,7 @@ pub async fn open_paths_with_workspace_factory(
 
     let expanded_paths = expand_ambiguous_paths(&abs_paths);
     let (existing, open_visible) =
-        find_existing_workspace(&expanded_paths, open_options, location, is_dir, cx).await;
+        find_existing_workspace(&expanded_paths, open_options, location, &is_dir, cx).await;
 
     let result = if let Some(workspace) = existing {
         open_paths_in_existing_workspace(workspace, &abs_paths, open_visible, cx).await
