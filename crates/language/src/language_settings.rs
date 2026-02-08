@@ -9,7 +9,7 @@ use ec4rs::{
 use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
 use gpui::{App, Modifiers, SharedString};
 use itertools::{Either, Itertools};
-use settings::IntoGpui;
+use settings::{DocumentFoldingRanges, IntoGpui, SemanticTokens};
 
 pub use settings::{
     CompletionSettingsContent, EditPredictionProvider, EditPredictionsMode, FormatOnSave,
@@ -106,6 +106,11 @@ pub struct LanguageSettings {
     /// - `"!<language_server_id>"` - A language server ID prefixed with a `!` will be disabled.
     /// - `"..."` - A placeholder to refer to the **rest** of the registered language servers for this language.
     pub language_servers: Vec<String>,
+    /// Controls how semantic tokens from language servers are used for syntax highlighting.
+    pub semantic_tokens: SemanticTokens,
+    /// Controls whether folding ranges from language servers are used instead of
+    /// tree-sitter and indent-based folding.
+    pub document_folding_ranges: DocumentFoldingRanges,
     /// Controls where the `editor::Rewrap` action is allowed for this language.
     ///
     /// Note: This setting has no effect in Vim mode, as rewrap is already
@@ -396,7 +401,6 @@ pub struct EditPredictionSettings {
     /// This setting has no effect if globally disabled.
     pub enabled_in_text_threads: bool,
     pub examples_dir: Option<Arc<Path>>,
-    pub example_capture_rate: Option<u16>,
 }
 
 impl EditPredictionSettings {
@@ -590,6 +594,8 @@ impl settings::Settings for AllLanguageSettings {
                 jsx_tag_auto_close: settings.jsx_tag_auto_close.unwrap().enabled.unwrap(),
                 enable_language_server: settings.enable_language_server.unwrap(),
                 language_servers: settings.language_servers.unwrap(),
+                semantic_tokens: settings.semantic_tokens.unwrap(),
+                document_folding_ranges: settings.document_folding_ranges.unwrap(),
                 allow_rewrap: settings.allow_rewrap.unwrap(),
                 show_edit_predictions: settings.show_edit_predictions.unwrap(),
                 edit_predictions_disabled_in: settings.edit_predictions_disabled_in.unwrap(),
@@ -738,7 +744,6 @@ impl settings::Settings for AllLanguageSettings {
                 ollama: ollama_settings,
                 enabled_in_text_threads,
                 examples_dir: edit_predictions.examples_dir,
-                example_capture_rate: edit_predictions.example_capture_rate,
             },
             defaults: default_language_settings,
             languages,
