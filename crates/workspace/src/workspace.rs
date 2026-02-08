@@ -8312,10 +8312,11 @@ pub fn open_workspace_by_id(
     })
 }
 
-pub async fn find_existing_workspace(
+pub async fn find_existing_workspace<IsDirFut: Future<Output = bool> + Send>(
     abs_paths: &[PathBuf],
     open_options: &OpenOptions,
     location: &SerializedWorkspaceLocation,
+    is_dir: impl Fn(PathBuf) -> IsDirFut + Send,
     cx: &mut AsyncApp,
 ) -> (Option<WindowHandle<Workspace>>, OpenVisible) {
     let mut existing = None;
@@ -8367,7 +8368,8 @@ pub async fn find_existing_workspace(
             .unwrap_or(false);
 
         if open_options.open_new_workspace.is_none()
-            && (existing.is_none() || open_options.wait)
+            && existing.is_some()
+            && open_options.wait
             && all_paths_are_files
         {
             cx.update(|cx| {
@@ -8379,6 +8381,28 @@ pub async fn find_existing_workspace(
                     open_visible = OpenVisible::None;
                 }
             });
+        }
+
+        if open_options.open_new_workspace.is_none() && existing.is_none() {
+            let candidate = cx.update(|cx| {
+                workspace_windows_for_location(location, cx)
+                    .into_iter()
+                    .next()
+            });
+
+            if let Some(window) = candidate {
+                let mut all_files = true;
+                for path in abs_paths {
+                    if is_dir(path.clone()).await {
+                        all_files = false;
+                        break;
+                    }
+                }
+                if all_files {
+                    existing = Some(window);
+                    open_visible = OpenVisible::None;
+                }
+            }
         }
     }
     return (existing, open_visible);
@@ -8394,54 +8418,28 @@ pub fn open_paths(
 ) -> Task<anyhow::Result<OpenedItems>> {
     let abs_paths = abs_paths.to_vec();
     cx.spawn(async move |cx| {
+        let fs = app_state.fs.clone();
+        let is_dir = |path: PathBuf| -> BoxFuture<'static, bool> {
+            let fs = fs.clone();
+            Box::pin(async move { fs.is_dir(&path).await })
+        };
         open_paths_with_workspace_factory(
             abs_paths,
             &SerializedWorkspaceLocation::Local,
             &open_options,
+            &is_dir,
             |paths, cx| {
                 let app_state = app_state.clone();
                 let open_options = open_options.clone();
-                cx.spawn(async move |cx| {
-                    // Check if all paths are files (not directories).
-                    // If so, and open_new_workspace isn't explicitly requested,
-                    // return None to signal we should reuse an existing workspace.
-                    if open_options.open_new_workspace.is_none() {
-                        let mut all_files = true;
-                        for path in &paths {
-                            if let Ok(Some(metadata)) = app_state.fs.metadata(path).await {
-                                if metadata.is_dir {
-                                    all_files = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if all_files {
-                            let has_existing_workspace = cx.update(|cx| {
-                                !workspace_windows_for_location(
-                                    &SerializedWorkspaceLocation::Local,
-                                    cx,
-                                )
-                                .is_empty()
-                            });
-                            if has_existing_workspace {
-                                return Ok(None);
-                            }
-                        }
-                    }
-
-                    cx.update(|cx| {
-                        Workspace::new_local(
-                            paths,
-                            app_state.clone(),
-                            open_options.replace_window,
-                            open_options.env.clone(),
-                            None,
-                            cx,
-                        )
-                    })
-                    .await
-                    .map(Some)
-                })
+                let task = Workspace::new_local(
+                    paths,
+                    app_state.clone(),
+                    open_options.replace_window,
+                    open_options.env.clone(),
+                    None,
+                    cx,
+                );
+                cx.spawn(async move |_| task.await.map(Some))
             },
             cx,
         )
@@ -8495,6 +8493,7 @@ pub async fn open_paths_with_workspace_factory(
     abs_paths: Vec<PathBuf>,
     location: &SerializedWorkspaceLocation,
     open_options: &OpenOptions,
+    is_dir: &dyn Fn(PathBuf) -> BoxFuture<'static, bool>,
     workspace_factory: impl FnOnce(Vec<PathBuf>, &mut App) -> Task<anyhow::Result<Option<OpenedItems>>>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<OpenedItems> {
@@ -8505,7 +8504,7 @@ pub async fn open_paths_with_workspace_factory(
 
     let expanded_paths = expand_ambiguous_paths(&abs_paths);
     let (existing, open_visible) =
-        find_existing_workspace(&expanded_paths, open_options, location, cx).await;
+        find_existing_workspace(&expanded_paths, open_options, location, is_dir, cx).await;
 
     let result = if let Some(workspace) = existing {
         open_paths_in_existing_workspace(workspace, &abs_paths, open_visible, cx).await

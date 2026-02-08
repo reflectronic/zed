@@ -19,8 +19,11 @@ use language::Point;
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
 use recent_projects::{RemoteSettings, open_remote_project};
-use remote::{RemoteConnectionOptions, WslConnectionOptions};
+use remote::{
+    Interactive, RemoteConnectionOptions, WslConnectionOptions, remote_client::CommandTemplate,
+};
 use settings::Settings;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -341,12 +344,18 @@ pub async fn open_paths_for_location(
 ) -> Result<OpenedItems> {
     match location {
         SerializedWorkspaceLocation::Local => {
+            let fs = app_state.fs.clone();
+            let is_dir = |path: PathBuf| {
+                let fs = fs.clone();
+                async move { fs.is_dir(&path).await }
+            };
             open_paths_with_positions(
                 paths,
                 diff_paths,
                 diff_all,
                 location,
                 open_options,
+                is_dir,
                 |paths, cx| {
                     let task = Workspace::new_local(
                         paths,
@@ -369,12 +378,33 @@ pub async fn open_paths_for_location(
                     RemoteSettings::get_global(cx).fill_connection_options_from_settings(options)
                 });
             }
+            let remote_connection = cx.update(|cx| {
+                workspace::workspace_windows_for_location(location, cx)
+                    .into_iter()
+                    .next()
+                    .and_then(|window| {
+                        let workspace = window.read(cx).ok()?;
+                        let remote_client = workspace.project().read(cx).remote_client()?;
+                        remote_client.read(cx).connection()
+                    })
+            });
+            let is_dir = move |path: PathBuf| {
+                let remote_connection = remote_connection.clone();
+                async move {
+                    if let Some(conn) = remote_connection {
+                        remote_path_is_dir(&conn, &path).await
+                    } else {
+                        true
+                    }
+                }
+            };
             open_paths_with_positions(
                 paths,
                 diff_paths,
                 diff_all,
                 location,
                 open_options,
+                is_dir,
                 |paths, cx| {
                     let connection = connection.clone();
                     let app_state = app_state.clone();
@@ -390,12 +420,34 @@ pub async fn open_paths_for_location(
     }
 }
 
-pub async fn open_paths_with_positions(
+async fn remote_path_is_dir(connection: &Arc<dyn remote::RemoteConnection>, path: &Path) -> bool {
+    let command = match connection.build_command(
+        Some("test".to_string()),
+        &["-d".to_owned(), path.to_string_lossy().to_string()],
+        &Default::default(),
+        None,
+        None,
+        Interactive::No,
+    ) {
+        Ok(CommandTemplate { program, args, env }) => util::command::new_smol_command(program)
+            .args(args)
+            .envs(env)
+            .spawn(),
+        Err(_) => return false,
+    };
+    match command {
+        Ok(mut child) => child.status().await.is_ok_and(|status| status.success()),
+        Err(_) => false,
+    }
+}
+
+pub async fn open_paths_with_positions<IsDirFut: Future<Output = bool> + Send>(
     paths: Vec<PathBuf>,
     diff_paths: &[[String; 2]],
     diff_all: bool,
     location: &SerializedWorkspaceLocation,
     open_options: &OpenOptions,
+    is_dir: impl Fn(PathBuf) -> IsDirFut + Send + Sync,
     workspace_factory: impl FnOnce(
         Vec<PathBuf>,
         &mut gpui::App,
@@ -410,6 +462,7 @@ pub async fn open_paths_with_positions(
         paths,
         location,
         open_options,
+        is_dir,
         workspace_factory,
         cx,
     )
@@ -1161,10 +1214,16 @@ mod tests {
 
         // Now test the reuse functionality - should replace the existing workspace
         let workspace_paths_reuse = vec![PathBuf::from(file1_path)];
+        let fs = app_state.fs.clone();
+        let is_dir = |path: PathBuf| {
+            let fs = fs.clone();
+            async move { fs.is_dir(&path).await }
+        };
         let window_to_replace = find_existing_workspace(
             &workspace_paths_reuse,
             &workspace::OpenOptions::default(),
             &workspace::SerializedWorkspaceLocation::Local,
+            is_dir,
             &mut cx.to_async(),
         )
         .await
