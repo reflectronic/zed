@@ -125,7 +125,7 @@ impl ProcessMemoryCache {
 
     fn is_descendant_of(&self, pid: Pid, root_pid: Pid, parent_map: &HashMap<Pid, Pid>) -> bool {
         let mut current = pid;
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         while current != root_pid {
             if !visited.insert(current) {
                 return false;
