@@ -8,7 +8,7 @@ use askpass::EncryptedPassword;
 use editor::Editor;
 use extension_host::ExtensionStore;
 use futures::{FutureExt as _, channel::oneshot, select};
-use gpui::{AppContext, AsyncApp, PromptLevel};
+use gpui::{AppContext, AsyncApp, PromptLevel, WindowHandle};
 
 use language::Point;
 use project::trusted_worktrees;
@@ -19,7 +19,10 @@ use remote::{
 pub use settings::SshConnection;
 use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
 use util::paths::PathWithPosition;
-use workspace::{AppState, MultiWorkspace, Workspace};
+use workspace::{
+    AppState, MultiWorkspace, OpenOptions, SerializedWorkspaceLocation, Workspace,
+    find_existing_workspace,
+};
 
 pub use remote_connection::{
     RemoteClientDelegate, RemoteConnectionModal, RemoteConnectionPrompt, SshConnectionHeader,
@@ -131,6 +134,69 @@ pub async fn open_remote_project(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let created_new_window = open_options.replace_window.is_none();
+
+    let (existing, open_visible) = find_existing_workspace(
+        &paths,
+        &open_options,
+        &SerializedWorkspaceLocation::Remote(connection_options.clone()),
+        cx,
+    )
+    .await;
+
+    if let Some((existing_window, existing_workspace)) = existing {
+        let remote_connection = cx
+            .update(|cx| {
+                existing_workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .remote_client()
+                    .and_then(|client| client.read(cx).remote_connection())
+            })
+            .ok_or_else(|| anyhow::anyhow!("no remote connection for existing remote workspace"))?;
+
+        let (resolved_paths, paths_with_positions) =
+            determine_paths_with_positions(&remote_connection, paths).await;
+
+        let open_results = existing_window
+            .update(cx, |multi_workspace, window, cx| {
+                window.activate_window();
+                multi_workspace.activate(existing_workspace.clone(), cx);
+                existing_workspace.update(cx, |workspace, cx| {
+                    workspace.open_paths(
+                        resolved_paths,
+                        OpenOptions {
+                            visible: Some(open_visible),
+                            ..Default::default()
+                        },
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            })?
+            .await;
+
+        _ = existing_window.update(cx, |multi_workspace, _, cx| {
+            let workspace = multi_workspace.workspace().clone();
+            workspace.update(cx, |workspace, cx| {
+                for item in open_results.iter().flatten() {
+                    if let Err(e) = item {
+                        workspace.show_error(&e, cx);
+                    }
+                }
+            });
+        });
+
+        let items = open_results
+            .into_iter()
+            .map(|r| r.and_then(|r| r.ok()))
+            .collect::<Vec<_>>();
+        navigate_to_positions(&existing_window, items, &paths_with_positions, cx);
+
+        return Ok(());
+    }
+
     let (window, initial_workspace) = if let Some(window) = open_options.replace_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
             multi_workspace.workspace().clone()
@@ -342,29 +408,7 @@ pub async fn open_remote_project(
             }
 
             Ok(items) => {
-                for (item, path) in items.into_iter().zip(paths_with_positions) {
-                    let Some(item) = item else {
-                        continue;
-                    };
-                    let Some(row) = path.row else {
-                        continue;
-                    };
-                    if let Some(active_editor) = item.downcast::<Editor>() {
-                        window
-                            .update(cx, |_, window, cx| {
-                                active_editor.update(cx, |editor, cx| {
-                                    let row = row.saturating_sub(1);
-                                    let col = path.column.unwrap_or(0).saturating_sub(1);
-                                    editor.go_to_singleton_buffer_point(
-                                        Point::new(row, col),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            })
-                            .ok();
-                    }
-                }
+                navigate_to_positions(&window, items, &paths_with_positions, cx);
             }
         }
 
@@ -388,6 +432,33 @@ pub async fn open_remote_project(
         })
         .ok();
     Ok(())
+}
+
+pub fn navigate_to_positions(
+    window: &WindowHandle<MultiWorkspace>,
+    items: impl IntoIterator<Item = Option<Box<dyn workspace::item::ItemHandle>>>,
+    positions: &[PathWithPosition],
+    cx: &mut AsyncApp,
+) {
+    for (item, path) in items.into_iter().zip(positions) {
+        let Some(item) = item else {
+            continue;
+        };
+        let Some(row) = path.row else {
+            continue;
+        };
+        if let Some(active_editor) = item.downcast::<Editor>() {
+            window
+                .update(cx, |_, window, cx| {
+                    active_editor.update(cx, |editor, cx| {
+                        let row = row.saturating_sub(1);
+                        let col = path.column.unwrap_or(0).saturating_sub(1);
+                        editor.go_to_singleton_buffer_point(Point::new(row, col), window, cx);
+                    });
+                })
+                .ok();
+        }
+    }
 }
 
 pub(crate) async fn determine_paths_with_positions(

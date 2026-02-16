@@ -322,7 +322,7 @@ fn main() {
     let (open_listener, mut open_rx) = OpenListener::new();
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
-        || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+    // || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
     {
         false
     } else {
