@@ -515,6 +515,7 @@ mod tests {
     use remote_server::{HeadlessAppState, HeadlessProject};
     use serde_json::json;
     use util::path;
+    use workspace::find_existing_workspace;
 
     #[gpui::test]
     async fn test_open_remote_project_with_mock_connection(
@@ -594,6 +595,131 @@ mod tests {
                 });
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_reuse_existing_remote_workspace_window(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let executor = cx.executor();
+
+        cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        server_cx.update(|cx| {
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+
+        let remote_fs = FakeFs::new(server_cx.executor());
+        remote_fs
+            .insert_tree(
+                path!("/project"),
+                json!({
+                    "src": {
+                        "main.rs": "fn main() {}",
+                        "lib.rs": "pub fn hello() {}",
+                    },
+                    "README.md": "# Test Project",
+                }),
+            )
+            .await;
+
+        server_cx.update(HeadlessProject::init);
+        let http_client = Arc::new(BlockedHttpClient);
+        let node_runtime = NodeRuntime::unavailable();
+        let languages = Arc::new(language::LanguageRegistry::new(server_cx.executor()));
+        let proxy = Arc::new(ExtensionHostProxy::new());
+
+        let _headless = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session: server_session,
+                    fs: remote_fs.clone(),
+                    http_client,
+                    node_runtime,
+                    languages,
+                    extension_host_proxy: proxy,
+                },
+                false,
+                cx,
+            )
+        });
+
+        drop(connect_guard);
+
+        // First open: create a new window for the remote project.
+        let paths = vec![PathBuf::from(path!("/project"))];
+        let mut async_cx = cx.to_async();
+        open_remote_project(
+            opts.clone(),
+            paths,
+            app_state.clone(),
+            workspace::OpenOptions::default(),
+            &mut async_cx,
+        )
+        .await
+        .expect("first open_remote_project should succeed");
+
+        executor.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "First open should create exactly one window"
+        );
+
+        let first_window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+
+        // Verify find_existing_workspace discovers the remote workspace.
+        let search_paths = vec![PathBuf::from(path!("/project/src/lib.rs"))];
+        let (found, _open_visible) = find_existing_workspace(
+            &search_paths,
+            &workspace::OpenOptions::default(),
+            &SerializedWorkspaceLocation::Remote(opts.clone()),
+            &mut async_cx,
+        )
+        .await;
+
+        assert!(
+            found.is_some(),
+            "find_existing_workspace should locate the existing remote workspace"
+        );
+        let (found_window, _found_workspace) = found.unwrap();
+        assert_eq!(
+            found_window, first_window,
+            "find_existing_workspace should return the same window"
+        );
+
+        // Second open with the same connection options should reuse the window.
+        let second_paths = vec![PathBuf::from(path!("/project/src/lib.rs"))];
+        open_remote_project(
+            opts.clone(),
+            second_paths,
+            app_state.clone(),
+            workspace::OpenOptions::default(),
+            &mut async_cx,
+        )
+        .await
+        .expect("second open_remote_project should succeed via reuse");
+
+        executor.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "Second open should reuse the existing window, not create a new one"
+        );
+
+        let still_first_window =
+            cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        assert_eq!(
+            still_first_window, first_window,
+            "The window handle should be the same after reuse"
+        );
     }
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
