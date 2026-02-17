@@ -9,6 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::SharedString;
+
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone)]
 pub struct TaskTiming {
@@ -55,20 +57,20 @@ impl ThreadTaskTimings {
 }
 
 /// Serializable variant of [`core::panic::Location`]
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct SerializedLocation<'a> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedLocation {
     /// Name of the source file
-    pub file: &'a str,
+    pub file: SharedString,
     /// Line in the source file
     pub line: u32,
     /// Column in the source file
     pub column: u32,
 }
 
-impl<'a> From<&'a core::panic::Location<'a>> for SerializedLocation<'a> {
-    fn from(value: &'a core::panic::Location<'a>) -> Self {
+impl From<&core::panic::Location<'static>> for SerializedLocation {
+    fn from(value: &core::panic::Location<'static>) -> Self {
         SerializedLocation {
-            file: value.file(),
+            file: value.file().into(),
             line: value.line(),
             column: value.column(),
         }
@@ -77,23 +79,22 @@ impl<'a> From<&'a core::panic::Location<'a>> for SerializedLocation<'a> {
 
 /// Serializable variant of [`TaskTiming`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializedTaskTiming<'a> {
+pub struct SerializedTaskTiming {
     /// Location of the timing
-    #[serde(borrow)]
-    pub location: SerializedLocation<'a>,
+    pub location: SerializedLocation,
     /// Time at which the measurement was reported in nanoseconds
     pub start: u128,
     /// Duration of the measurement in nanoseconds
     pub duration: u128,
 }
 
-impl<'a> SerializedTaskTiming<'a> {
+impl SerializedTaskTiming {
     /// Convert an array of [`TaskTiming`] into their serializable format
     ///
     /// # Params
     ///
     /// `anchor` - [`Instant`] that should be earlier than all timings to use as base anchor
-    pub fn convert(anchor: Instant, timings: &[TaskTiming]) -> Vec<SerializedTaskTiming<'static>> {
+    pub fn convert(anchor: Instant, timings: &[TaskTiming]) -> Vec<SerializedTaskTiming> {
         let serialized = timings
             .iter()
             .map(|timing| {
@@ -117,26 +118,22 @@ impl<'a> SerializedTaskTiming<'a> {
 
 /// Serializable variant of [`ThreadTaskTimings`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializedThreadTaskTimings<'a> {
+pub struct SerializedThreadTaskTimings {
     /// Thread name
     pub thread_name: Option<String>,
     /// Hash of the thread id
     pub thread_id: u64,
     /// Timing records for this thread
-    #[serde(borrow)]
-    pub timings: Vec<SerializedTaskTiming<'a>>,
+    pub timings: Vec<SerializedTaskTiming>,
 }
 
-impl<'a> SerializedThreadTaskTimings<'a> {
+impl SerializedThreadTaskTimings {
     /// Convert [`ThreadTaskTimings`] into their serializable format
     ///
     /// # Params
     ///
     /// `anchor` - [`Instant`] that should be earlier than all timings to use as base anchor
-    pub fn convert(
-        anchor: Instant,
-        timings: ThreadTaskTimings,
-    ) -> SerializedThreadTaskTimings<'static> {
+    pub fn convert(anchor: Instant, timings: ThreadTaskTimings) -> SerializedThreadTaskTimings {
         let serialized_timings = SerializedTaskTiming::convert(anchor, &timings.timings);
 
         let mut hasher = DefaultHasher::new();

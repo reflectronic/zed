@@ -1,15 +1,10 @@
-use std::{
-    ops::Range,
-    path::PathBuf,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{path::PathBuf, rc::Rc, time::Duration};
 
 use gpui::{
     App, AppContext, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement,
-    ParentElement as _, Render, SerializedTaskTiming, SharedString, StatefulInteractiveElement,
-    Styled, Task, TaskTiming, TitlebarOptions, UniformListScrollHandle, WeakEntity, WindowBounds,
-    WindowOptions, div, prelude::FluentBuilder, px, relative, size, uniform_list,
+    ParentElement as _, Render, SerializedLocation, SerializedTaskTiming, SharedString,
+    StatefulInteractiveElement, Styled, Task, TitlebarOptions, UniformListScrollHandle, WeakEntity,
+    WindowBounds, WindowOptions, div, prelude::FluentBuilder, px, relative, size, uniform_list,
 };
 use util::ResultExt;
 use workspace::{
@@ -21,7 +16,10 @@ use workspace::{
 };
 use zed_actions::OpenPerformanceProfiler;
 
-pub fn init(startup_time: Instant, cx: &mut App) {
+const NANOS_PER_MS: u128 = 1_000_000;
+const VISIBLE_WINDOW_NANOS: u128 = 10 * 1_000_000_000;
+
+pub fn init(startup_time: std::time::Instant, cx: &mut App) {
     cx.observe_new(move |workspace: &mut workspace::Workspace, _, cx| {
         let workspace_handle = cx.entity().downgrade();
         workspace.register_action(move |_workspace, _: &OpenPerformanceProfiler, window, cx| {
@@ -32,7 +30,7 @@ pub fn init(startup_time: Instant, cx: &mut App) {
 }
 
 fn open_performance_profiler(
-    startup_time: Instant,
+    startup_time: std::time::Instant,
     workspace_handle: WeakEntity<Workspace>,
     _window: &mut gpui::Window,
     cx: &mut App,
@@ -76,21 +74,16 @@ fn open_performance_profiler(
     .log_err();
 }
 
-enum DataMode {
-    Realtime(Option<Vec<TaskTiming>>),
-    Snapshot(Vec<TaskTiming>),
-}
-
 struct TimingBar {
-    location: &'static core::panic::Location<'static>,
-    start: Instant,
-    end: Instant,
+    location: SerializedLocation,
+    start_nanos: u128,
+    duration_nanos: u128,
     color: Hsla,
 }
 
 pub struct ProfilerWindow {
-    startup_time: Instant,
-    data: DataMode,
+    startup_time: std::time::Instant,
+    timings: Vec<SerializedTaskTiming>,
     include_self_timings: ToggleState,
     autoscroll: bool,
     scroll_handle: UniformListScrollHandle,
@@ -100,21 +93,19 @@ pub struct ProfilerWindow {
 
 impl ProfilerWindow {
     pub fn new(
-        startup_time: Instant,
+        startup_time: std::time::Instant,
         workspace_handle: Option<WeakEntity<Workspace>>,
         cx: &mut App,
     ) -> Entity<Self> {
-        let entity = cx.new(|cx| ProfilerWindow {
+        cx.new(|cx| ProfilerWindow {
             startup_time,
-            data: DataMode::Realtime(None),
+            timings: Vec::new(),
             include_self_timings: ToggleState::Unselected,
             autoscroll: true,
             scroll_handle: UniformListScrollHandle::default(),
             workspace: workspace_handle,
             _refresh: Some(Self::begin_listen(cx)),
-        });
-
-        entity
+        })
     }
 
     fn begin_listen(cx: &mut Context<Self>) -> Task<()> {
@@ -126,12 +117,11 @@ impl ProfilerWindow {
                     .get_current_thread_timings();
 
                 this.update(cx, |this: &mut ProfilerWindow, cx| {
-                    this.data = DataMode::Realtime(Some(data));
+                    this.timings = SerializedTaskTiming::convert(this.startup_time, &data);
                     cx.notify();
                 })
                 .ok();
 
-                // yield to the executor
                 cx.background_executor()
                     .timer(Duration::from_micros(1))
                     .await;
@@ -139,40 +129,40 @@ impl ProfilerWindow {
         })
     }
 
-    fn get_timings(&self) -> Option<&Vec<TaskTiming>> {
-        match &self.data {
-            DataMode::Realtime(data) => data.as_ref(),
-            DataMode::Snapshot(data) => Some(data),
-        }
+    fn is_paused(&self) -> bool {
+        self._refresh.is_none()
     }
 
-    fn render_timing(value_range: Range<Instant>, item: TimingBar, cx: &App) -> Div {
-        let time_ms = item.end.duration_since(item.start).as_secs_f32() * 1000f32;
+    fn render_timing(
+        window_start_nanos: u128,
+        window_duration_nanos: u128,
+        item: TimingBar,
+        cx: &App,
+    ) -> Div {
+        let time_ms = item.duration_nanos as f32 / NANOS_PER_MS as f32;
 
-        let remap = value_range
-            .end
-            .duration_since(value_range.start)
-            .as_secs_f32()
-            * 1000f32;
+        let start_fraction = if item.start_nanos >= window_start_nanos {
+            (item.start_nanos - window_start_nanos) as f32 / window_duration_nanos as f32
+        } else {
+            0.0
+        };
 
-        let start = (item.start.duration_since(value_range.start).as_secs_f32() * 1000f32) / remap;
-        let end = (item.end.duration_since(value_range.start).as_secs_f32() * 1000f32) / remap;
+        let end_nanos = item.start_nanos + item.duration_nanos;
+        let end_fraction = if end_nanos >= window_start_nanos {
+            (end_nanos - window_start_nanos) as f32 / window_duration_nanos as f32
+        } else {
+            0.0
+        };
 
-        let bar_width = end - start.abs();
+        let bar_width = (end_fraction - start_fraction).max(0.0);
 
-        let location = item
-            .location
-            .file()
-            .rsplit_once("/")
-            .unwrap_or(("", item.location.file()))
-            .1;
-        let location = location.rsplit_once("\\").unwrap_or(("", location)).1;
+        let file_str: &str = &item.location.file;
+        let basename = file_str.rsplit_once("/").unwrap_or(("", file_str)).1;
+        let basename = basename.rsplit_once("\\").unwrap_or(("", basename)).1;
 
         let label = SharedString::from(format!(
             "{}:{}:{}",
-            location,
-            item.location.line(),
-            item.location.column()
+            basename, item.location.line, item.location.column
         ));
 
         h_flex()
@@ -205,7 +195,7 @@ impl ProfilerWindow {
                             .h_full()
                             .rounded_sm()
                             .bg(item.color)
-                            .left(relative(start.max(0f32)))
+                            .left(relative(start_fraction.max(0.0)))
                             .w(relative(bar_width)),
                     ),
             )
@@ -250,25 +240,16 @@ impl Render for ProfilerWindow {
                             .child(
                                 Button::new(
                                     "switch-mode",
-                                    match self.data {
-                                        DataMode::Snapshot { .. } => "Resume",
-                                        DataMode::Realtime(_) => "Pause",
-                                    },
+                                    if self.is_paused() { "Resume" } else { "Pause" },
                                 )
                                 .style(ButtonStyle::Filled)
                                 .on_click(cx.listener(
                                     |this, _, _window, cx| {
-                                        match &this.data {
-                                            DataMode::Realtime(Some(data)) => {
-                                                this._refresh = None;
-                                                this.data = DataMode::Snapshot(data.clone());
-                                            }
-                                            DataMode::Snapshot { .. } => {
-                                                this._refresh = Some(Self::begin_listen(cx));
-                                                this.data = DataMode::Realtime(None);
-                                            }
-                                            _ => {}
-                                        };
+                                        if this.is_paused() {
+                                            this._refresh = Some(Self::begin_listen(cx));
+                                        } else {
+                                            this._refresh = None;
+                                        }
                                         cx.notify();
                                     },
                                 )),
@@ -281,11 +262,10 @@ impl Render for ProfilerWindow {
                                             return;
                                         };
 
-                                        let Some(data) = this.get_timings() else {
+                                        if this.timings.is_empty() {
                                             return;
-                                        };
-                                        let timings =
-                                            SerializedTaskTiming::convert(this.startup_time, &data);
+                                        }
+                                        let timings = this.timings.clone();
 
                                         let active_path = workspace
                                             .read_with(cx, |workspace, cx| {
@@ -331,33 +311,31 @@ impl Render for ProfilerWindow {
                             })),
                     ),
             )
-            .when_some(self.get_timings(), |div, e| {
-                if e.len() == 0 {
-                    return div;
-                }
+            .when(!self.timings.is_empty(), |div| {
+                let timings = &self.timings;
+                let min_nanos = timings[0].start;
+                let last = &timings[timings.len() - 1];
+                let max_nanos = last.start + last.duration;
 
-                let min = e[0].start;
-                let max = e[e.len() - 1].end.unwrap_or_else(|| Instant::now());
                 let timings = Rc::new(
-                    e.into_iter()
-                        .filter(|timing| {
-                            timing
-                                .end
-                                .unwrap_or_else(|| Instant::now())
-                                .duration_since(timing.start)
-                                .as_millis()
-                                >= 1
-                        })
+                    timings
+                        .iter()
+                        .filter(|timing| timing.duration / NANOS_PER_MS >= 1)
                         .filter(|timing| {
                             if self.include_self_timings.selected() {
                                 true
                             } else {
-                                !timing.location.file().ends_with("miniprofiler_ui.rs")
+                                !timing.location.file.ends_with("miniprofiler_ui.rs")
                             }
                         })
                         .cloned()
                         .collect::<Vec<_>>(),
                 );
+
+                let window_start_nanos = max_nanos
+                    .saturating_sub(VISIBLE_WINDOW_NANOS)
+                    .max(min_nanos);
+                let window_duration_nanos = max_nanos.saturating_sub(window_start_nanos).max(1);
 
                 div.child(Divider::horizontal()).child(
                     v_flex()
@@ -372,15 +350,13 @@ impl Render for ProfilerWindow {
                                     let mut items = vec![];
                                     for i in visible_range {
                                         let timing = &timings[i];
-                                        let value_range =
-                                            max.checked_sub(Duration::from_secs(10)).unwrap_or(min)
-                                                ..max;
                                         items.push(Self::render_timing(
-                                            value_range,
+                                            window_start_nanos,
+                                            window_duration_nanos,
                                             TimingBar {
-                                                location: timing.location,
-                                                start: timing.start,
-                                                end: timing.end.unwrap_or_else(|| Instant::now()),
+                                                location: timing.location.clone(),
+                                                start_nanos: timing.start,
+                                                duration_nanos: timing.duration,
                                                 color: cx
                                                     .theme()
                                                     .accents()
