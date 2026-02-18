@@ -10193,6 +10193,7 @@ dependencies = [
  "gpui",
  "serde_json",
  "smol",
+ "theme",
  "util",
  "workspace",
  "zed_actions",

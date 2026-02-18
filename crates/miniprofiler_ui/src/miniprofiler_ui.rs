@@ -338,6 +338,7 @@ impl Render for ProfilerWindow {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
+        let ui_font = theme::setup_ui_font(window, cx);
         let scroll_offset = self.scroll_handle.offset();
         let max_offset = self.scroll_handle.max_offset();
         self.autoscroll = -scroll_offset.y >= (max_offset.height - px(24.));
@@ -347,6 +348,7 @@ impl Render for ProfilerWindow {
 
         v_flex()
             .id("profiler")
+            .font(ui_font)
             .w_full()
             .h_full()
             .bg(cx.theme().colors().surface_background)
