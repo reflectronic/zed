@@ -2,22 +2,67 @@ use std::{path::PathBuf, rc::Rc, time::Duration};
 
 use gpui::{
     App, AppContext, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement,
-    ParentElement as _, Render, SerializedLocation, SerializedTaskTiming, SharedString,
-    StatefulInteractiveElement, Styled, Task, TitlebarOptions, UniformListScrollHandle, WeakEntity,
-    WindowBounds, WindowOptions, div, prelude::FluentBuilder, px, relative, size, uniform_list,
+    ParentElement as _, Render, SerializedLocation, SerializedTaskTiming,
+    SerializedThreadTaskTimings, SharedString, StatefulInteractiveElement, Styled, Task,
+    TitlebarOptions, UniformListScrollHandle, WeakEntity, WindowBounds, WindowOptions, div,
+    prelude::FluentBuilder, px, relative, size, uniform_list,
 };
 use util::ResultExt;
 use workspace::{
     Workspace,
     ui::{
-        ActiveTheme, Button, ButtonCommon, ButtonStyle, Checkbox, Clickable, Divider,
-        ScrollableHandle as _, ToggleState, Tooltip, WithScrollbar, h_flex, v_flex,
+        ActiveTheme, Button, ButtonCommon, ButtonStyle, Checkbox, Clickable, ContextMenu, Divider,
+        DropdownMenu, ScrollableHandle as _, ToggleState, Tooltip, WithScrollbar, h_flex, v_flex,
     },
 };
 use zed_actions::OpenPerformanceProfiler;
 
 const NANOS_PER_MS: u128 = 1_000_000;
 const VISIBLE_WINDOW_NANOS: u128 = 10 * 1_000_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileSource {
+    Foreground,
+    AllThreads,
+}
+
+impl ProfileSource {
+    fn label(&self) -> &'static str {
+        match self {
+            ProfileSource::Foreground => "Foreground",
+            ProfileSource::AllThreads => "All threads",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ProfileTimings {
+    Foreground(Vec<SerializedTaskTiming>),
+    AllThreads(Vec<SerializedThreadTaskTimings>),
+}
+
+impl ProfileTimings {
+    fn flattened_timings(&self) -> Vec<SerializedTaskTiming> {
+        match self {
+            ProfileTimings::Foreground(timings) => timings.clone(),
+            ProfileTimings::AllThreads(threads) => {
+                let mut all_timings = Vec::new();
+                for thread in threads {
+                    all_timings.extend(thread.timings.iter().cloned());
+                }
+                all_timings.sort_by_key(|t| t.start);
+                all_timings
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            ProfileTimings::Foreground(timings) => timings.is_empty(),
+            ProfileTimings::AllThreads(threads) => threads.iter().all(|t| t.timings.is_empty()),
+        }
+    }
+}
 
 pub fn init(startup_time: std::time::Instant, cx: &mut App) {
     cx.observe_new(move |workspace: &mut workspace::Workspace, _, cx| {
@@ -83,7 +128,8 @@ struct TimingBar {
 
 pub struct ProfilerWindow {
     startup_time: std::time::Instant,
-    timings: Vec<SerializedTaskTiming>,
+    source: ProfileSource,
+    timings: ProfileTimings,
     include_self_timings: ToggleState,
     autoscroll: bool,
     scroll_handle: UniformListScrollHandle,
@@ -97,30 +143,63 @@ impl ProfilerWindow {
         workspace_handle: Option<WeakEntity<Workspace>>,
         cx: &mut App,
     ) -> Entity<Self> {
+        let source = ProfileSource::Foreground;
         cx.new(|cx| ProfilerWindow {
             startup_time,
-            timings: Vec::new(),
+            source,
+            timings: ProfileTimings::Foreground(Vec::new()),
             include_self_timings: ToggleState::Unselected,
             autoscroll: true,
             scroll_handle: UniformListScrollHandle::default(),
             workspace: workspace_handle,
-            _refresh: Some(Self::begin_listen(cx)),
+            _refresh: Some(Self::begin_listen(source, cx)),
         })
     }
 
-    fn begin_listen(cx: &mut Context<Self>) -> Task<()> {
+    fn begin_listen(source: ProfileSource, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let data = cx
-                    .foreground_executor()
-                    .dispatcher()
-                    .get_current_thread_timings();
+                let timings = match source {
+                    ProfileSource::Foreground => {
+                        let data = cx
+                            .foreground_executor()
+                            .dispatcher()
+                            .get_current_thread_timings();
+                        this.update(cx, |this: &mut ProfilerWindow, _cx| {
+                            ProfileTimings::Foreground(SerializedTaskTiming::convert(
+                                this.startup_time,
+                                &data,
+                            ))
+                        })
+                        .ok()
+                    }
+                    ProfileSource::AllThreads => {
+                        let thread_timings =
+                            cx.foreground_executor().dispatcher().get_all_timings();
+                        this.update(cx, |this: &mut ProfilerWindow, _cx| {
+                            ProfileTimings::AllThreads(
+                                thread_timings
+                                    .into_iter()
+                                    .map(|thread| {
+                                        SerializedThreadTaskTimings::convert(
+                                            this.startup_time,
+                                            thread,
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .ok()
+                    }
+                };
 
-                this.update(cx, |this: &mut ProfilerWindow, cx| {
-                    this.timings = SerializedTaskTiming::convert(this.startup_time, &data);
-                    cx.notify();
-                })
-                .ok();
+                if let Some(timings) = timings {
+                    this.update(cx, |this: &mut ProfilerWindow, cx| {
+                        this.timings = timings;
+                        cx.notify();
+                    })
+                    .ok();
+                }
 
                 cx.background_executor()
                     .timer(Duration::from_micros(1))
@@ -131,6 +210,50 @@ impl ProfilerWindow {
 
     fn is_paused(&self) -> bool {
         self._refresh.is_none()
+    }
+
+    fn set_source(&mut self, source: ProfileSource, cx: &mut Context<Self>) {
+        if self.source == source {
+            return;
+        }
+        self.source = source;
+        if !self.is_paused() {
+            self._refresh = Some(Self::begin_listen(source, cx));
+        }
+        cx.notify();
+    }
+
+    fn render_source_dropdown(
+        &self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> DropdownMenu {
+        let weak = cx.weak_entity();
+        let current_source = self.source;
+
+        let sources = [ProfileSource::Foreground, ProfileSource::AllThreads];
+
+        DropdownMenu::new(
+            "profile-source",
+            current_source.label(),
+            ContextMenu::build(window, cx, move |mut menu, window, cx| {
+                for source in sources {
+                    let weak = weak.clone();
+                    menu = menu.entry(source.label(), None, move |_, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.set_source(source, cx);
+                        })
+                        .log_err();
+                    });
+                }
+                if let Some(index) = sources.iter().position(|s| *s == current_source) {
+                    for _ in 0..=index {
+                        menu.select_next(&Default::default(), window, cx);
+                    }
+                }
+                menu
+            }),
+        )
     }
 
     fn render_timing(
@@ -237,6 +360,7 @@ impl Render for ProfilerWindow {
                     .child(
                         h_flex()
                             .gap_2()
+                            .child(self.render_source_dropdown(window, cx))
                             .child(
                                 Button::new(
                                     "switch-mode",
@@ -246,7 +370,8 @@ impl Render for ProfilerWindow {
                                 .on_click(cx.listener(
                                     |this, _, _window, cx| {
                                         if this.is_paused() {
-                                            this._refresh = Some(Self::begin_listen(cx));
+                                            this._refresh =
+                                                Some(Self::begin_listen(this.source, cx));
                                         } else {
                                             this._refresh = None;
                                         }
@@ -290,9 +415,15 @@ impl Render for ProfilerWindow {
                                                 return;
                                             };
 
-                                            let Some(timings) =
-                                                serde_json::to_string(&timings).log_err()
-                                            else {
+                                            let serialized = match &timings {
+                                                ProfileTimings::Foreground(t) => {
+                                                    serde_json::to_string(t)
+                                                }
+                                                ProfileTimings::AllThreads(t) => {
+                                                    serde_json::to_string(t)
+                                                }
+                                            };
+                                            let Some(timings) = serialized.log_err() else {
                                                 return;
                                             };
 
@@ -312,7 +443,12 @@ impl Render for ProfilerWindow {
                     ),
             )
             .when(!self.timings.is_empty(), |div| {
-                let timings = &self.timings;
+                let timings = self.timings.flattened_timings();
+
+                if timings.is_empty() {
+                    return div;
+                }
+
                 let min_nanos = timings[0].start;
                 let last = &timings[timings.len() - 1];
                 let max_nanos = last.start + last.duration;
