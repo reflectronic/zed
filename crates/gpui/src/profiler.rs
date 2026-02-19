@@ -315,7 +315,7 @@ pub(crate) fn add_task_timing(timing: TaskTiming) {
     THREAD_TIMINGS.with(|timings| {
         let mut timings = timings.lock();
 
-        if let Some(last_timing) = timings.timings.iter_mut().rev().next() {
+        if let Some(last_timing) = timings.timings.back_mut() {
             if last_timing.location == timing.location && last_timing.start == timing.start {
                 last_timing.end = timing.end;
                 return;

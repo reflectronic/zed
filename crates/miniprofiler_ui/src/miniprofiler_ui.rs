@@ -221,7 +221,6 @@ impl ProfilerWindow {
             return;
         }
 
-        let was_remote = self.source.is_remote();
         self.source = source;
 
         self.timings.clear();
@@ -231,9 +230,9 @@ impl ProfilerWindow {
         self.remote_received_at = None;
         self.has_remote = self.remote_proto_client(cx).is_some();
 
-        if source.is_remote() && !was_remote {
+        if source.is_remote() {
             self.start_remote_polling(cx);
-        } else if !source.is_remote() {
+        } else {
             self._remote_poll_task = None;
         }
     }
@@ -288,8 +287,7 @@ impl ProfilerWindow {
 
     fn apply_remote_response(&mut self, response: proto::GetRemoteProfilingDataResponse) {
         self.has_remote = true;
-        self.remote_now_nanos =
-            (response.now_nanos as u128).saturating_sub(REMOTE_POLL_INTERVAL.as_nanos());
+        self.remote_now_nanos = response.now_nanos as u128;
         self.remote_received_at = Some(Instant::now());
         let deltas = response
             .threads
@@ -628,9 +626,22 @@ impl Render for ProfilerWindow {
     }
 }
 
+const MAX_VISIBLE_PER_THREAD: usize = 10_000;
+
 fn visible_tail(timings: &[SerializedTaskTiming], cutoff_nanos: u128) -> &[SerializedTaskTiming] {
-    let start = timings.partition_point(|t| t.start + t.duration < cutoff_nanos);
-    &timings[start..]
+    let len = timings.len();
+    let limit = len.min(MAX_VISIBLE_PER_THREAD);
+    let search_start = len - limit;
+    let tail = &timings[search_start..];
+
+    let mut first_visible = 0;
+    for (i, timing) in tail.iter().enumerate().rev() {
+        if timing.start + timing.duration < cutoff_nanos {
+            first_visible = i + 1;
+            break;
+        }
+    }
+    &tail[first_visible..]
 }
 
 fn filter_timings(
