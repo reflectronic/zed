@@ -1135,7 +1135,6 @@ impl HeadlessProject {
             .map(|delta| proto::RemoteProfilingThread {
                 thread_name: delta.thread_name,
                 thread_id: delta.thread_id,
-                is_replacement: delta.is_replacement,
                 timings: delta
                     .new_timings
                     .into_iter()

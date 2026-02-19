@@ -159,13 +159,9 @@ pub struct ThreadTimingsDelta {
     pub thread_id: u64,
     /// Thread name, if known
     pub thread_name: Option<String>,
-    /// New timings since the last call
+    /// New timings since the last call. If the circular buffer wrapped around
+    /// since the previous poll, some entries may have been lost.
     pub new_timings: Vec<SerializedTaskTiming>,
-    /// If true, the circular buffer wrapped around since the last call and
-    /// `new_timings` contains the entire current buffer. The caller should
-    /// replace any previously accumulated data for this thread rather than
-    /// appending.
-    pub is_replacement: bool,
 }
 
 /// Tracks which timing events have already been seen so that callers can request only unseen events.
@@ -202,32 +198,27 @@ impl ProfilingCollector {
             let buffer_len = thread.timings.len() as u64;
             let buffer_start = thread.total_pushed.saturating_sub(buffer_len);
 
-            let (mut slice, is_replacement) = if prev_cursor < buffer_start {
-                (thread.timings.as_slice(), true)
+            let mut slice = if prev_cursor < buffer_start {
+                // Cursor fell behind the buffer — some entries were evicted.
+                // Return everything still in the buffer.
+                thread.timings.as_slice()
             } else {
                 let skip = (prev_cursor - buffer_start) as usize;
-                (&thread.timings[skip..], false)
+                &thread.timings[skip..]
             };
 
             // Don't emit the last entry if it's still in-progress (end: None).
-            // The dispatcher calls add_task_timing twice: once before running
-            // (end: None) and once after (end: Some). The second call merges
-            // in-place without incrementing total_pushed. If we advance the
-            // cursor past an incomplete entry, we'll never see its final
-            // duration.
             let incomplete_at_end = slice.last().is_some_and(|t| t.end.is_none());
             if incomplete_at_end {
                 slice = &slice[..slice.len() - 1];
             }
 
-            // Only advance the cursor past entries we're actually emitting.
-            // If we trimmed an incomplete entry, hold the cursor back by one
-            // so we revisit it next poll.
             let cursor_advance = if incomplete_at_end {
                 thread.total_pushed - 1
             } else {
                 thread.total_pushed
             };
+
             self.cursors.insert(hashed_id, cursor_advance);
 
             if slice.is_empty() {
@@ -240,7 +231,6 @@ impl ProfilingCollector {
                 thread_id: hashed_id,
                 thread_name: thread.thread_name,
                 new_timings,
-                is_replacement,
             });
         }
 

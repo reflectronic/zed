@@ -315,7 +315,6 @@ impl ProfilerWindow {
                     thread_id: thread.thread_id,
                     thread_name: thread.thread_name,
                     new_timings,
-                    is_replacement: thread.is_replacement,
                 }
             })
             .collect();
@@ -326,21 +325,12 @@ impl ProfilerWindow {
 
     fn apply_deltas(&mut self, deltas: Vec<ThreadTimingsDelta>) {
         for delta in deltas {
-            if delta.is_replacement {
-                upsert_thread(
-                    &mut self.timings,
-                    delta.thread_id,
-                    delta.thread_name,
-                    delta.new_timings,
-                );
-            } else {
-                append_to_thread(
-                    &mut self.timings,
-                    delta.thread_id,
-                    delta.thread_name,
-                    delta.new_timings,
-                );
-            }
+            append_to_thread(
+                &mut self.timings,
+                delta.thread_id,
+                delta.thread_name,
+                delta.new_timings,
+            );
         }
     }
 
@@ -692,26 +682,6 @@ fn kway_merge(lists: Vec<Vec<SerializedTaskTiming>>) -> Vec<SerializedTaskTiming
     }
 
     result
-}
-
-fn upsert_thread(
-    threads: &mut Vec<SerializedThreadTaskTimings>,
-    thread_id: u64,
-    thread_name: Option<String>,
-    timings: Vec<SerializedTaskTiming>,
-) {
-    if let Some(existing) = threads.iter_mut().find(|t| t.thread_id == thread_id) {
-        existing.timings = timings;
-        if existing.thread_name.is_none() {
-            existing.thread_name = thread_name;
-        }
-    } else {
-        threads.push(SerializedThreadTaskTimings {
-            thread_name,
-            thread_id,
-            timings,
-        });
-    }
 }
 
 fn append_to_thread(
