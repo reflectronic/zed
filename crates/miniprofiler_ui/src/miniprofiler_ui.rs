@@ -1,5 +1,5 @@
 use std::{
-    hash::{Hash, Hasher},
+    hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
@@ -7,11 +7,12 @@ use std::{
 
 use gpui::{
     App, AppContext, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement,
-    ParentElement as _, Render, SerializedLocation, SerializedTaskTiming,
-    SerializedThreadTaskTimings, SharedString, StatefulInteractiveElement, Styled, TaskTiming,
-    ThreadTaskTimings, TitlebarOptions, UniformListScrollHandle, WeakEntity, WindowBounds,
+    ParentElement as _, ProfilingCollector, Render, SerializedLocation, SerializedTaskTiming,
+    SerializedThreadTaskTimings, SharedString, StatefulInteractiveElement, Styled, Task,
+    ThreadTimingsDelta, TitlebarOptions, UniformListScrollHandle, WeakEntity, WindowBounds,
     WindowOptions, div, prelude::FluentBuilder, px, relative, size, uniform_list,
 };
+use rpc::{AnyProtoClient, proto};
 use util::ResultExt;
 use workspace::{
     Workspace,
@@ -25,12 +26,13 @@ use zed_actions::OpenPerformanceProfiler;
 
 const NANOS_PER_MS: u128 = 1_000_000;
 const VISIBLE_WINDOW_NANOS: u128 = 10 * 1_000_000_000;
-const VISIBLE_WINDOW_DURATION: Duration = Duration::from_secs(10);
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProfileSource {
     Foreground,
     AllThreads,
+    RemoteAllThreads,
 }
 
 impl ProfileSource {
@@ -38,23 +40,12 @@ impl ProfileSource {
         match self {
             ProfileSource::Foreground => "Foreground",
             ProfileSource::AllThreads => "All threads",
+            ProfileSource::RemoteAllThreads => "Remote: All threads",
         }
     }
-}
 
-enum ProfileTimings {
-    Foreground(Vec<TaskTiming>),
-    AllThreads(Vec<ThreadTaskTimings>),
-    // RemoteForeground(Vec<SerializedTaskTiming>),
-    // RemoteAllThreads(Vec<SerializedThreadTaskTimings>),
-}
-
-impl ProfileTimings {
-    fn is_empty(&self) -> bool {
-        match self {
-            ProfileTimings::Foreground(timings) => timings.is_empty(),
-            ProfileTimings::AllThreads(threads) => threads.iter().all(|t| t.timings.is_empty()),
-        }
+    fn is_remote(&self) -> bool {
+        matches!(self, ProfileSource::RemoteAllThreads)
     }
 }
 
@@ -89,28 +80,31 @@ fn open_performance_profiler(
         return;
     }
 
+    let window_background = cx.theme().window_background_appearance();
     let default_bounds = size(px(1280.), px(720.));
 
-    cx.open_window(
-        WindowOptions {
-            titlebar: Some(TitlebarOptions {
-                title: Some("Profiler Window".into()),
-                appears_transparent: false,
-                traffic_light_position: None,
-            }),
-            focus: true,
-            show: true,
-            is_movable: true,
-            kind: gpui::WindowKind::Normal,
-            window_background: cx.theme().window_background_appearance(),
-            window_decorations: None,
-            window_min_size: Some(default_bounds),
-            window_bounds: Some(WindowBounds::centered(default_bounds, cx)),
-            ..Default::default()
-        },
-        |_window, cx| ProfilerWindow::new(startup_time, Some(workspace_handle), cx),
-    )
-    .log_err();
+    cx.defer(move |cx| {
+        cx.open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Profiler Window".into()),
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }),
+                focus: true,
+                show: true,
+                is_movable: true,
+                kind: gpui::WindowKind::Normal,
+                window_background,
+                window_decorations: None,
+                window_min_size: Some(default_bounds),
+                window_bounds: Some(WindowBounds::centered(default_bounds, cx)),
+                ..Default::default()
+            },
+            |_window, cx| ProfilerWindow::new(startup_time, Some(workspace_handle), cx),
+        )
+        .log_err();
+    });
 }
 
 struct TimingBar {
@@ -121,15 +115,21 @@ struct TimingBar {
 }
 
 pub struct ProfilerWindow {
-    startup_time: Instant,
+    collector: ProfilingCollector,
     source: ProfileSource,
-    timings: ProfileTimings,
+    timings: Vec<SerializedThreadTaskTimings>,
+    foreground_thread_id: u64,
     paused: bool,
     display_timings: Rc<Vec<SerializedTaskTiming>>,
     include_self_timings: ToggleState,
     autoscroll: bool,
     scroll_handle: UniformListScrollHandle,
     workspace: Option<WeakEntity<Workspace>>,
+    has_remote: bool,
+    remote_now_nanos: u128,
+    remote_received_at: Option<Instant>,
+    _remote_poll_task: Option<Task<()>>,
+    _test_task: Option<Task<()>>,
 }
 
 impl ProfilerWindow {
@@ -138,53 +138,293 @@ impl ProfilerWindow {
         workspace_handle: Option<WeakEntity<Workspace>>,
         cx: &mut App,
     ) -> Entity<Self> {
+        let mut hasher = DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        let foreground_thread_id = hasher.finish();
+
         cx.new(|_cx| ProfilerWindow {
-            startup_time,
+            collector: ProfilingCollector::new(startup_time),
             source: ProfileSource::Foreground,
-            timings: ProfileTimings::Foreground(Vec::new()),
+            foreground_thread_id,
+            timings: Vec::new(),
             paused: false,
             display_timings: Rc::new(Vec::new()),
             include_self_timings: ToggleState::Unselected,
             autoscroll: true,
             scroll_handle: UniformListScrollHandle::default(),
             workspace: workspace_handle,
+            has_remote: false,
+            remote_now_nanos: 0,
+            remote_received_at: None,
+            _remote_poll_task: None,
+            _test_task: None,
         })
     }
 
     fn poll_timings(&mut self, cx: &App) {
-        let dispatcher = cx.foreground_executor().dispatcher();
-        let window_cutoff = Instant::now().checked_sub(VISIBLE_WINDOW_DURATION);
-        let include_self = self.include_self_timings.selected();
-        let anchor = self.startup_time;
-
+        self.has_remote = self.remote_proto_client(cx).is_some();
         match self.source {
-            ProfileSource::Foreground => {
-                let data = dispatcher.get_current_thread_timings();
-                let visible = visible_tail(&data, window_cutoff);
-                let display = convert_and_filter(anchor, visible, include_self);
-                self.display_timings = Rc::new(display);
-                self.timings = ProfileTimings::Foreground(data);
+            ProfileSource::Foreground | ProfileSource::AllThreads => {
+                let dispatcher = cx.foreground_executor().dispatcher();
+                let all_timings = dispatcher.get_all_timings();
+                let deltas = self.collector.collect_unseen(all_timings);
+                self.apply_deltas(deltas);
             }
-            ProfileSource::AllThreads => {
-                let thread_data = dispatcher.get_all_timings();
-                let visible_threads: Vec<Vec<SerializedTaskTiming>> = thread_data
-                    .iter()
-                    .map(|thread| {
-                        let visible = visible_tail(&thread.timings, window_cutoff);
-                        convert_and_filter(anchor, visible, include_self)
-                    })
-                    .collect();
-                self.display_timings = Rc::new(kway_merge(visible_threads));
-                self.timings = ProfileTimings::AllThreads(thread_data);
+            ProfileSource::RemoteAllThreads => {
+                // Remote timings arrive asynchronously via apply_remote_response.
             }
+        }
+        self.rebuild_display_timings();
+    }
+
+    fn rebuild_display_timings(&mut self) {
+        let include_self = self.include_self_timings.selected();
+        let cutoff_nanos = self.now_nanos().saturating_sub(VISIBLE_WINDOW_NANOS);
+        let foreground_only = self.source == ProfileSource::Foreground;
+        let foreground_id = self.foreground_thread_id;
+
+        let matching_threads = self
+            .timings
+            .iter()
+            .filter(|thread| !foreground_only || thread.thread_id == foreground_id);
+
+        let per_thread: Vec<Vec<SerializedTaskTiming>> = matching_threads
+            .map(|thread| {
+                debug_assert!(
+                    thread.timings.windows(2).all(|w| w[0].start <= w[1].start),
+                    "stored timings for thread {:?} (id={}) are not sorted by start time",
+                    thread.thread_name,
+                    thread.thread_id,
+                );
+
+                debug_assert!(
+                    thread
+                        .timings
+                        .windows(2)
+                        .all(|w| (w[0].start + w[0].duration) <= (w[1].start + w[1].duration)),
+                    "stored timings for thread {:?} (id={}) have non-monotonic end times \
+                     (start + duration), which breaks partition_point in visible_tail",
+                    thread.thread_name,
+                    thread.thread_id,
+                );
+
+                let visible = visible_tail(&thread.timings, cutoff_nanos);
+
+                debug_assert!(
+                    !thread.timings.is_empty() || visible.is_empty(),
+                    "visible_tail returned non-empty slice from empty timings for thread {:?}",
+                    thread.thread_name,
+                );
+
+                if !thread.timings.is_empty() && visible.is_empty() {
+                    let last = thread.timings.last().expect("checked non-empty");
+                    let last_end = last.start + last.duration;
+                    debug_assert!(
+                        last_end <= cutoff_nanos,
+                        "visible_tail discarded all {} timings for thread {:?} (id={}) \
+                         but the last timing ends at {} which is after cutoff {}. \
+                         now_nanos={}, VISIBLE_WINDOW_NANOS={}",
+                        thread.timings.len(),
+                        thread.thread_name,
+                        thread.thread_id,
+                        last_end,
+                        cutoff_nanos,
+                        self.now_nanos(),
+                        VISIBLE_WINDOW_NANOS,
+                    );
+                }
+
+                filter_timings(visible.iter().cloned(), include_self)
+            })
+            .collect();
+
+        let merged = kway_merge(per_thread);
+
+        debug_assert!(
+            merged.windows(2).all(|w| w[0].start <= w[1].start),
+            "kway_merge produced unsorted output",
+        );
+
+        self.display_timings = Rc::new(merged);
+    }
+
+    fn now_nanos(&self) -> u128 {
+        if self.source.is_remote() {
+            let elapsed_since_poll = self
+                .remote_received_at
+                .map(|at| Instant::now().duration_since(at).as_nanos())
+                .unwrap_or(0);
+            self.remote_now_nanos + elapsed_since_poll
+        } else {
+            Instant::now()
+                .duration_since(self.collector.startup_time())
+                .as_nanos()
         }
     }
 
-    fn set_source(&mut self, source: ProfileSource) {
+    fn set_source(&mut self, source: ProfileSource, cx: &mut Context<Self>) {
         if self.source == source {
             return;
         }
+
+        let was_remote = self.source.is_remote();
         self.source = source;
+
+        self.timings.clear();
+        self.collector.reset();
+        self.display_timings = Rc::new(Vec::new());
+        self.remote_now_nanos = 0;
+        self.remote_received_at = None;
+        self.has_remote = self.remote_proto_client(cx).is_some();
+
+        if source.is_remote() && !was_remote {
+            self.start_remote_polling(cx);
+        } else if !source.is_remote() {
+            self._remote_poll_task = None;
+        }
+    }
+
+    fn remote_proto_client(&self, cx: &App) -> Option<AnyProtoClient> {
+        let workspace = self.workspace.as_ref()?;
+        workspace
+            .read_with(cx, |workspace, cx| {
+                let project = workspace.project().read(cx);
+                let remote_client = project.remote_client()?;
+                Some(remote_client.read(cx).proto_client())
+            })
+            .log_err()
+            .flatten()
+    }
+
+    fn start_remote_polling(&mut self, cx: &mut Context<Self>) {
+        let Some(proto_client) = self.remote_proto_client(cx) else {
+            return;
+        };
+
+        let weak = cx.weak_entity();
+        self._remote_poll_task = Some(cx.spawn(async move |_this, cx| {
+            loop {
+                let response = proto_client
+                    .request(proto::GetRemoteProfilingData {
+                        project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    })
+                    .await;
+
+                match response {
+                    Ok(response) => {
+                        let ok = weak.update(&mut cx.clone(), |this, cx| {
+                            this.apply_remote_response(response);
+                            cx.notify();
+                        });
+                        if ok.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        Err::<(), _>(error).log_err();
+                    }
+                }
+
+                cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
+            }
+        }));
+    }
+
+    fn apply_remote_response(&mut self, response: proto::GetRemoteProfilingDataResponse) {
+        self.has_remote = true;
+        self.remote_now_nanos =
+            (response.now_nanos as u128).saturating_sub(REMOTE_POLL_INTERVAL.as_nanos());
+        self.remote_received_at = Some(Instant::now());
+        let deltas = response
+            .threads
+            .into_iter()
+            .map(|thread| {
+                let new_timings = thread
+                    .timings
+                    .into_iter()
+                    .map(|t| {
+                        let location = t.location.unwrap_or_default();
+                        SerializedTaskTiming {
+                            location: SerializedLocation {
+                                file: SharedString::from(location.file),
+                                line: location.line,
+                                column: location.column,
+                            },
+                            start: t.start_nanos as u128,
+                            duration: t.duration_nanos as u128,
+                        }
+                    })
+                    .collect();
+                ThreadTimingsDelta {
+                    thread_id: thread.thread_id,
+                    thread_name: thread.thread_name,
+                    new_timings,
+                    is_replacement: thread.is_replacement,
+                }
+            })
+            .collect();
+
+        self.apply_deltas(deltas);
+        self.rebuild_display_timings();
+    }
+
+    fn apply_deltas(&mut self, deltas: Vec<ThreadTimingsDelta>) {
+        for delta in deltas {
+            debug_assert!(
+                delta
+                    .new_timings
+                    .windows(2)
+                    .all(|w| w[0].start <= w[1].start),
+                "new timings in delta for thread {:?} (id={}) are not sorted by start time",
+                delta.thread_name,
+                delta.thread_id,
+            );
+            debug_assert!(
+                delta.new_timings.iter().all(|t| t.duration > 0),
+                "zero-duration timing in delta for thread {:?} (id={})",
+                delta.thread_name,
+                delta.thread_id,
+            );
+            if delta.is_replacement {
+                debug_assert!(
+                    self.source.is_remote(),
+                    "unexpected ring buffer replacement for local thread {:?} (id={}): \
+                     the 20MB ring buffer wrapped around between polls, which means timings \
+                     were lost",
+                    delta.thread_name,
+                    delta.thread_id,
+                );
+                upsert_thread(
+                    &mut self.timings,
+                    delta.thread_id,
+                    delta.thread_name,
+                    delta.new_timings,
+                );
+            } else {
+                if let Some(existing) = self.timings.iter().find(|t| t.thread_id == delta.thread_id)
+                {
+                    if let (Some(last_existing), Some(first_new)) =
+                        (existing.timings.last(), delta.new_timings.first())
+                    {
+                        debug_assert!(
+                            last_existing.start <= first_new.start,
+                            "new timings for thread {:?} (id={}) go backwards: \
+                             last existing start={}, first new start={}",
+                            delta.thread_name,
+                            delta.thread_id,
+                            last_existing.start,
+                            first_new.start,
+                        );
+                    }
+                }
+                append_to_thread(
+                    &mut self.timings,
+                    delta.thread_id,
+                    delta.thread_name,
+                    delta.new_timings,
+                );
+            }
+        }
     }
 
     fn render_source_dropdown(
@@ -194,18 +434,23 @@ impl ProfilerWindow {
     ) -> DropdownMenu {
         let weak = cx.weak_entity();
         let current_source = self.source;
+        let has_remote = self.has_remote;
 
-        let sources = [ProfileSource::Foreground, ProfileSource::AllThreads];
+        let mut sources = vec![ProfileSource::Foreground, ProfileSource::AllThreads];
+        if has_remote {
+            sources.push(ProfileSource::RemoteAllThreads);
+        }
 
         DropdownMenu::new(
             "profile-source",
             current_source.label(),
             ContextMenu::build(window, cx, move |mut menu, window, cx| {
-                for source in sources {
+                for source in &sources {
+                    let source = *source;
                     let weak = weak.clone();
                     menu = menu.entry(source.label(), None, move |_, cx| {
                         weak.update(cx, |this, cx| {
-                            this.set_source(source);
+                            this.set_source(source, cx);
                             cx.notify();
                         })
                         .log_err();
@@ -344,6 +589,11 @@ impl Render for ProfilerWindow {
                                 .on_click(cx.listener(
                                     |this, _, _window, cx| {
                                         this.paused = !this.paused;
+                                        if !this.paused && this.source.is_remote() {
+                                            this.start_remote_polling(cx);
+                                        } else if this.paused && this.source.is_remote() {
+                                            this._remote_poll_task = None;
+                                        }
                                         cx.notify();
                                     },
                                 )),
@@ -356,31 +606,11 @@ impl Render for ProfilerWindow {
                                             return;
                                         };
 
-                                        if this.timings.is_empty() {
+                                        if this.timings.iter().all(|t| t.timings.is_empty()) {
                                             return;
                                         }
 
-                                        let anchor = this.startup_time;
-                                        let serialized = match &this.timings {
-                                            ProfileTimings::Foreground(data) => {
-                                                let converted =
-                                                    SerializedTaskTiming::convert(anchor, data);
-                                                serde_json::to_string(&converted)
-                                            }
-                                            ProfileTimings::AllThreads(threads) => {
-                                                let converted: Vec<SerializedThreadTaskTimings> =
-                                                    threads
-                                                        .iter()
-                                                        .map(|t| {
-                                                            SerializedThreadTaskTimings::convert(
-                                                                anchor,
-                                                                t.clone(),
-                                                            )
-                                                        })
-                                                        .collect();
-                                                serde_json::to_string(&converted)
-                                            }
-                                        };
+                                        let serialized = serde_json::to_string(&this.timings);
 
                                         let Some(serialized) = serialized.log_err() else {
                                             return;
@@ -422,11 +652,56 @@ impl Render for ProfilerWindow {
                                 this.include_self_timings = *checked;
                                 cx.notify();
                             })),
+                    )
+                    .child(
+                        Button::new(
+                            "spawn-test-tasks",
+                            if self._test_task.is_some() {
+                                "Stop Test Tasks"
+                            } else {
+                                "Spawn Test Tasks"
+                            },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            if this._test_task.is_some() {
+                                this._test_task = None;
+                            } else {
+                                this._test_task = Some(cx.spawn(async move |_this, cx| {
+                                    loop {
+                                        // Foreground task: ~5ms of work
+                                        let start = Instant::now();
+                                        while start.elapsed() < Duration::from_millis(5) {
+                                            std::hint::black_box(0u64);
+                                        }
+
+                                        // Background task: ~3ms of work
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                println!("Starting test task");
+
+                                                let start = Instant::now();
+                                                while start.elapsed() < Duration::from_millis(3) {
+                                                    std::hint::black_box(0u64);
+                                                }
+                                                println!("Ending test task");
+                                            })
+                                            .await;
+
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(200))
+                                            .await;
+                                    }
+                                }));
+                            }
+                            cx.notify();
+                        })),
                     ),
             )
             .when(!display_timings.is_empty(), |div| {
+                let now_nanos = self.now_nanos();
+
                 let min_nanos = display_timings[0].start;
-                let now_nanos = Instant::now().duration_since(self.startup_time).as_nanos();
                 let last = &display_timings[display_timings.len() - 1];
                 let max_nanos = (last.start + last.duration).max(now_nanos);
 
@@ -484,41 +759,23 @@ impl Render for ProfilerWindow {
     }
 }
 
-fn visible_tail<'a>(timings: &'a [TaskTiming], cutoff: Option<Instant>) -> &'a [TaskTiming] {
-    let Some(cutoff) = cutoff else {
-        return timings;
-    };
-    let start = timings.partition_point(|t| t.start < cutoff);
+fn visible_tail(timings: &[SerializedTaskTiming], cutoff_nanos: u128) -> &[SerializedTaskTiming] {
+    let start = timings.partition_point(|t| t.start + t.duration < cutoff_nanos);
     &timings[start..]
 }
 
-fn convert_and_filter(
-    anchor: Instant,
-    timings: &[TaskTiming],
+fn filter_timings(
+    timings: impl Iterator<Item = SerializedTaskTiming>,
     include_self: bool,
 ) -> Vec<SerializedTaskTiming> {
     timings
-        .iter()
-        .map(|timing| {
-            let start = timing.start.duration_since(anchor).as_nanos();
-            let duration = timing
-                .end
-                .unwrap_or_else(Instant::now)
-                .duration_since(timing.start)
-                .as_nanos();
-            SerializedTaskTiming {
-                location: timing.location.into(),
-                start,
-                duration,
-            }
-        })
-        .filter(|timing| timing.duration / NANOS_PER_MS >= 1)
-        .filter(|timing| include_self || !timing.location.file.ends_with("miniprofiler_ui.rs"))
+        .filter(|t| t.duration / NANOS_PER_MS >= 1)
+        .filter(|t| include_self || !t.location.file.ends_with("miniprofiler_ui.rs"))
         .collect()
 }
 
 fn location_color_index(location: &SerializedLocation) -> u32 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = DefaultHasher::new();
     location.file.hash(&mut hasher);
     location.line.hash(&mut hasher);
     location.column.hash(&mut hasher);
@@ -556,4 +813,44 @@ fn kway_merge(lists: Vec<Vec<SerializedTaskTiming>>) -> Vec<SerializedTaskTiming
     }
 
     result
+}
+
+fn upsert_thread(
+    threads: &mut Vec<SerializedThreadTaskTimings>,
+    thread_id: u64,
+    thread_name: Option<String>,
+    timings: Vec<SerializedTaskTiming>,
+) {
+    if let Some(existing) = threads.iter_mut().find(|t| t.thread_id == thread_id) {
+        existing.timings = timings;
+        if existing.thread_name.is_none() {
+            existing.thread_name = thread_name;
+        }
+    } else {
+        threads.push(SerializedThreadTaskTimings {
+            thread_name,
+            thread_id,
+            timings,
+        });
+    }
+}
+
+fn append_to_thread(
+    threads: &mut Vec<SerializedThreadTaskTimings>,
+    thread_id: u64,
+    thread_name: Option<String>,
+    new_timings: Vec<SerializedTaskTiming>,
+) {
+    if let Some(existing) = threads.iter_mut().find(|t| t.thread_id == thread_id) {
+        existing.timings.extend(new_timings);
+        if existing.thread_name.is_none() {
+            existing.thread_name = thread_name;
+        }
+    } else {
+        threads.push(SerializedThreadTaskTimings {
+            thread_name,
+            thread_id,
+            timings: new_timings,
+        });
+    }
 }

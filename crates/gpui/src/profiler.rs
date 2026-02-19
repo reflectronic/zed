@@ -1,5 +1,6 @@
 use std::{
     cell::LazyCell,
+    collections::HashMap,
     hash::Hasher,
     hash::{DefaultHasher, Hash},
     sync::Arc,
@@ -25,6 +26,7 @@ pub struct ThreadTaskTimings {
     pub thread_name: Option<String>,
     pub thread_id: ThreadId,
     pub timings: Vec<TaskTiming>,
+    pub total_pushed: u64,
 }
 
 impl ThreadTaskTimings {
@@ -38,7 +40,18 @@ impl ThreadTaskTimings {
             .map(|(thread_id, timings)| {
                 let timings = timings.lock();
                 let thread_name = timings.thread_name.clone();
+                let total_pushed = timings.total_pushed;
                 let timings = &timings.timings;
+
+                debug_assert!(
+                    total_pushed >= timings.len() as u64,
+                    "thread {:?} (id={:?}): total_pushed ({}) < buffer len ({}), \
+                     which will break cursor math in collect_unseen",
+                    thread_name,
+                    thread_id,
+                    total_pushed,
+                    timings.len(),
+                );
 
                 let mut vec = Vec::with_capacity(timings.len());
 
@@ -50,6 +63,7 @@ impl ThreadTaskTimings {
                     thread_name,
                     thread_id,
                     timings: vec,
+                    total_pushed,
                 }
             })
             .collect()
@@ -98,6 +112,13 @@ impl SerializedTaskTiming {
         let serialized = timings
             .iter()
             .map(|timing| {
+                debug_assert!(
+                    timing.start >= anchor,
+                    "timing at {}:{} has start before anchor, \
+                     which will cause duration_since to saturate to zero",
+                    timing.location.file(),
+                    timing.location.line(),
+                );
                 let start = timing.start.duration_since(anchor).as_nanos();
                 let duration = timing
                     .end
@@ -148,6 +169,150 @@ impl SerializedThreadTaskTimings {
     }
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ThreadTimingsDelta {
+    /// Hashed thread id
+    pub thread_id: u64,
+    /// Thread name, if known
+    pub thread_name: Option<String>,
+    /// New timings since the last call
+    pub new_timings: Vec<SerializedTaskTiming>,
+    /// If true, the circular buffer wrapped around since the last call and
+    /// `new_timings` contains the entire current buffer. The caller should
+    /// replace any previously accumulated data for this thread rather than
+    /// appending.
+    pub is_replacement: bool,
+}
+
+/// Tracks which timing events have already been seen so that callers can request only unseen events.
+#[doc(hidden)]
+pub struct ProfilingCollector {
+    startup_time: Instant,
+    cursors: HashMap<u64, u64>,
+}
+
+impl ProfilingCollector {
+    pub fn new(startup_time: Instant) -> Self {
+        Self {
+            startup_time,
+            cursors: HashMap::default(),
+        }
+    }
+
+    pub fn startup_time(&self) -> Instant {
+        self.startup_time
+    }
+
+    pub fn collect_unseen(
+        &mut self,
+        all_timings: Vec<ThreadTaskTimings>,
+    ) -> Vec<ThreadTimingsDelta> {
+        let mut deltas = Vec::with_capacity(all_timings.len());
+
+        for thread in all_timings {
+            let mut hasher = DefaultHasher::new();
+            thread.thread_id.hash(&mut hasher);
+            let hashed_id = hasher.finish();
+
+            let prev_cursor = self.cursors.get(&hashed_id).copied().unwrap_or(0);
+            let buffer_len = thread.timings.len() as u64;
+            let buffer_start = thread.total_pushed.saturating_sub(buffer_len);
+
+            debug_assert!(
+                thread.total_pushed >= buffer_len,
+                "thread {:?} (id={:?}): total_pushed ({}) < buffer_len ({})",
+                thread.thread_name,
+                thread.thread_id,
+                thread.total_pushed,
+                buffer_len,
+            );
+
+            debug_assert!(
+                prev_cursor <= thread.total_pushed,
+                "thread {:?} (id={:?}): cursor ({}) is ahead of total_pushed ({})",
+                thread.thread_name,
+                thread.thread_id,
+                prev_cursor,
+                thread.total_pushed,
+            );
+
+            debug_assert!(
+                thread.timings.windows(2).all(|w| w[0].start <= w[1].start),
+                "thread {:?} (id={:?}): raw timings from circular buffer are not sorted by start",
+                thread.thread_name,
+                thread.thread_id,
+            );
+
+            let (mut slice, is_replacement) = if prev_cursor < buffer_start {
+                (thread.timings.as_slice(), true)
+            } else {
+                let skip = (prev_cursor - buffer_start) as usize;
+                debug_assert!(
+                    skip <= thread.timings.len(),
+                    "thread {:?} (id={:?}): skip ({}) exceeds buffer len ({}), \
+                     prev_cursor={}, buffer_start={}, total_pushed={}",
+                    thread.thread_name,
+                    thread.thread_id,
+                    skip,
+                    thread.timings.len(),
+                    prev_cursor,
+                    buffer_start,
+                    thread.total_pushed,
+                );
+                (&thread.timings[skip..], false)
+            };
+
+            // Don't emit the last entry if it's still in-progress (end: None).
+            // The dispatcher calls add_task_timing twice: once before running
+            // (end: None) and once after (end: Some). The second call merges
+            // in-place without incrementing total_pushed. If we advance the
+            // cursor past an incomplete entry, we'll never see its final
+            // duration.
+            let incomplete_at_end = slice.last().is_some_and(|t| t.end.is_none());
+            if incomplete_at_end {
+                slice = &slice[..slice.len() - 1];
+            }
+
+            // Only advance the cursor past entries we're actually emitting.
+            // If we trimmed an incomplete entry, hold the cursor back by one
+            // so we revisit it next poll.
+            let cursor_advance = if incomplete_at_end {
+                thread.total_pushed - 1
+            } else {
+                thread.total_pushed
+            };
+            self.cursors.insert(hashed_id, cursor_advance);
+
+            if slice.is_empty() {
+                continue;
+            }
+
+            let new_timings = SerializedTaskTiming::convert(self.startup_time, slice);
+
+            debug_assert!(
+                new_timings.windows(2).all(|w| w[0].start <= w[1].start),
+                "thread {:?} (id={:?}): serialized timings are not sorted after convert",
+                thread.thread_name,
+                thread.thread_id,
+            );
+
+            deltas.push(ThreadTimingsDelta {
+                thread_id: hashed_id,
+                thread_name: thread.thread_name,
+                new_timings,
+                is_replacement,
+            });
+        }
+
+        deltas
+    }
+
+    pub fn reset(&mut self) {
+        self.cursors.clear();
+    }
+}
+
 // Allow 20mb of task timing entries
 const MAX_TASK_TIMINGS: usize = (20 * 1024 * 1024) / core::mem::size_of::<TaskTiming>();
 
@@ -187,6 +352,7 @@ pub(crate) struct ThreadTimings {
     pub thread_name: Option<String>,
     pub thread_id: ThreadId,
     pub timings: Box<TaskTimings>,
+    pub total_pushed: u64,
 }
 
 impl ThreadTimings {
@@ -195,6 +361,7 @@ impl ThreadTimings {
             thread_name,
             thread_id,
             timings: TaskTimings::boxed(),
+            total_pushed: 0,
         }
     }
 }
@@ -218,15 +385,26 @@ impl Drop for ThreadTimings {
 pub(crate) fn add_task_timing(timing: TaskTiming) {
     THREAD_TIMINGS.with(|timings| {
         let mut timings = timings.lock();
-        let timings = &mut timings.timings;
 
-        if let Some(last_timing) = timings.iter_mut().rev().next() {
+        if let Some(last_timing) = timings.timings.iter_mut().rev().next() {
+            debug_assert!(
+                timing.start >= last_timing.start,
+                "add_task_timing: new timing at {}:{} has start ({:?}) before previous timing \
+                 at {}:{} start ({:?})",
+                timing.location.file(),
+                timing.location.line(),
+                timing.start,
+                last_timing.location.file(),
+                last_timing.location.line(),
+                last_timing.start,
+            );
             if last_timing.location == timing.location {
                 last_timing.end = timing.end;
                 return;
             }
         }
 
-        timings.push_back(timing);
+        timings.timings.push_back(timing);
+        timings.total_pushed += 1;
     });
 }
