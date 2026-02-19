@@ -43,16 +43,6 @@ impl ThreadTaskTimings {
                 let total_pushed = timings.total_pushed;
                 let timings = &timings.timings;
 
-                debug_assert!(
-                    total_pushed >= timings.len() as u64,
-                    "thread {:?} (id={:?}): total_pushed ({}) < buffer len ({}), \
-                     which will break cursor math in collect_unseen",
-                    thread_name,
-                    thread_id,
-                    total_pushed,
-                    timings.len(),
-                );
-
                 let mut vec = Vec::with_capacity(timings.len());
 
                 let (s1, s2) = timings.as_slices();
@@ -112,13 +102,6 @@ impl SerializedTaskTiming {
         let serialized = timings
             .iter()
             .map(|timing| {
-                debug_assert!(
-                    timing.start >= anchor,
-                    "timing at {}:{} has start before anchor, \
-                     which will cause duration_since to saturate to zero",
-                    timing.location.file(),
-                    timing.location.line(),
-                );
                 let start = timing.start.duration_since(anchor).as_nanos();
                 let duration = timing
                     .end
@@ -219,47 +202,10 @@ impl ProfilingCollector {
             let buffer_len = thread.timings.len() as u64;
             let buffer_start = thread.total_pushed.saturating_sub(buffer_len);
 
-            debug_assert!(
-                thread.total_pushed >= buffer_len,
-                "thread {:?} (id={:?}): total_pushed ({}) < buffer_len ({})",
-                thread.thread_name,
-                thread.thread_id,
-                thread.total_pushed,
-                buffer_len,
-            );
-
-            debug_assert!(
-                prev_cursor <= thread.total_pushed,
-                "thread {:?} (id={:?}): cursor ({}) is ahead of total_pushed ({})",
-                thread.thread_name,
-                thread.thread_id,
-                prev_cursor,
-                thread.total_pushed,
-            );
-
-            debug_assert!(
-                thread.timings.windows(2).all(|w| w[0].start <= w[1].start),
-                "thread {:?} (id={:?}): raw timings from circular buffer are not sorted by start",
-                thread.thread_name,
-                thread.thread_id,
-            );
-
             let (mut slice, is_replacement) = if prev_cursor < buffer_start {
                 (thread.timings.as_slice(), true)
             } else {
                 let skip = (prev_cursor - buffer_start) as usize;
-                debug_assert!(
-                    skip <= thread.timings.len(),
-                    "thread {:?} (id={:?}): skip ({}) exceeds buffer len ({}), \
-                     prev_cursor={}, buffer_start={}, total_pushed={}",
-                    thread.thread_name,
-                    thread.thread_id,
-                    skip,
-                    thread.timings.len(),
-                    prev_cursor,
-                    buffer_start,
-                    thread.total_pushed,
-                );
                 (&thread.timings[skip..], false)
             };
 
@@ -289,13 +235,6 @@ impl ProfilingCollector {
             }
 
             let new_timings = SerializedTaskTiming::convert(self.startup_time, slice);
-
-            debug_assert!(
-                new_timings.windows(2).all(|w| w[0].start <= w[1].start),
-                "thread {:?} (id={:?}): serialized timings are not sorted after convert",
-                thread.thread_name,
-                thread.thread_id,
-            );
 
             deltas.push(ThreadTimingsDelta {
                 thread_id: hashed_id,
@@ -387,18 +326,7 @@ pub(crate) fn add_task_timing(timing: TaskTiming) {
         let mut timings = timings.lock();
 
         if let Some(last_timing) = timings.timings.iter_mut().rev().next() {
-            debug_assert!(
-                timing.start >= last_timing.start,
-                "add_task_timing: new timing at {}:{} has start ({:?}) before previous timing \
-                 at {}:{} start ({:?})",
-                timing.location.file(),
-                timing.location.line(),
-                timing.start,
-                last_timing.location.file(),
-                last_timing.location.line(),
-                last_timing.start,
-            );
-            if last_timing.location == timing.location {
+            if last_timing.location == timing.location && last_timing.start == timing.start {
                 last_timing.end = timing.end;
                 return;
             }

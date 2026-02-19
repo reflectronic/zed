@@ -1109,14 +1109,20 @@ impl HeadlessProject {
 
     async fn handle_get_remote_profiling_data(
         this: Entity<Self>,
-        _envelope: TypedEnvelope<proto::GetRemoteProfilingData>,
+        envelope: TypedEnvelope<proto::GetRemoteProfilingData>,
         cx: AsyncApp,
     ) -> Result<proto::GetRemoteProfilingDataResponse> {
-        let all_timings = cx.background_executor().dispatcher().get_all_timings();
+        let foreground_only = envelope.payload.foreground_only;
 
         let (deltas, now_nanos) = cx.update(|cx| {
+            let dispatcher = cx.foreground_executor().dispatcher();
+            let timings = if foreground_only {
+                vec![dispatcher.get_current_thread_timings()]
+            } else {
+                dispatcher.get_all_timings()
+            };
             this.update(cx, |this, _cx| {
-                let deltas = this.profiling_collector.collect_unseen(all_timings);
+                let deltas = this.profiling_collector.collect_unseen(timings);
                 let now_nanos = Instant::now()
                     .duration_since(this.profiling_collector.startup_time())
                     .as_nanos() as u64;

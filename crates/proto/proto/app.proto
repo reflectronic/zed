@@ -66,6 +66,7 @@ message AskPassResponse {
 
 message GetRemoteProfilingData {
     uint64 project_id = 1;
+    bool foreground_only = 2;
 }
 
 message GetRemoteProfilingDataResponse {
