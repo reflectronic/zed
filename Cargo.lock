@@ -10191,7 +10191,6 @@ name = "miniprofiler_ui"
 version = "0.1.0"
 dependencies = [
  "gpui",
- "project",
  "rpc",
  "serde_json",
  "smol",
